@@ -932,32 +932,56 @@ class Monitor:
         # 조작 줄. 누르는 키는 자판 모양으로, 설명글은 그 옆에 차분하게 둔다.
         # 갱신 주기·정렬 같은 '지금 상태'는 제목 줄과 표 머리에 이미 있으니
         # 여기서는 빼서, 이 줄은 오로지 '누를 것'만 남게 한다
+        # (키, 긴 설명, 짧은 설명, 설명 없이도 뜻이 통하는가, 지금 켜져 있는가)
         keys = [
-            ("↑↓", "고르기", False),
-            ("k", "종료시키기", False),
-            ("c", "CPU순", self.sort_key == "cpu"),
-            ("m", "메모리순", self.sort_key == "mem"),
-            ("+/-", "갱신", False),
-            ("q", "나가기", False),
+            ("↑↓", "고르기", "선택", True, False),
+            ("k", "종료시키기", "종료", False, False),
+            ("c", "CPU순", "CPU", False, self.sort_key == "cpu"),
+            ("m", "메모리순", "메모리", False, self.sort_key == "mem"),
+            ("+/-", "갱신 간격", "간격", False, False),
+            ("q", "나가기", "끝", True, False),
         ]
-        # 설명글까지 다 넣으면 좁은 창에서 뒤쪽 키(q 나가기)가 통째로 잘린다.
-        # 그럴 땐 설명글만 접고 키는 하나도 빠뜨리지 않는다
-        full_w = 1 + sum(dwidth(k) + dwidth(label) + 5 for k, label, _ in keys)
-        with_labels = full_w <= cols
+        # 좁은 창이라고 설명글을 한꺼번에 접으면 k·c·m 이 무슨 키인지 알 길이 없다.
+        # 긴 설명 → 짧은 설명 → 간격 줄이기 → 뻔한 키(↑↓, q)의 설명 빼기 순으로
+        # 조금씩 줄여서, 들어가는 한 가장 자세한 모양을 쓴다. 키는 하나도 빠뜨리지 않는다
+        tiers = [
+            (lambda k: k[1], 2),
+            (lambda k: k[2], 2),
+            (lambda k: k[2], 1),
+            (lambda k: "" if k[3] else k[2], 1),
+            (lambda k: "", 1),
+        ]
+
+        def width_of(label_of, gap):
+            w = 1
+            for k in keys:
+                label = label_of(k)
+                w += dwidth(k[0]) + 2 + gap
+                if label:
+                    w += 1 + dwidth(label)
+                elif k[4]:
+                    w += 1  # 설명이 빠져도 켜진 정렬 기준은 · 로 남긴다
+            return w
+
+        label_of, gap = next(
+            ((f, g) for f, g in tiers if width_of(f, g) <= cols), tiers[-1]
+        )
 
         bar = [FOOTER_BG, " "]
         used = 1
-        for key, label, active in keys:
+        for k in keys:
+            key, active = k[0], k[4]
+            label = label_of(k)
             bar.append(f"{KEY_BG}{BOLD} {key} {RESET}{FOOTER_BG}")
             used += dwidth(key) + 2
-            if with_labels:
+            if label:
                 bar.append(f" {FOOTER_ON if active else FOOTER_TEXT}{label}{FOOTER_TEXT}")
                 used += 1 + dwidth(label)
-            elif active:  # 설명글이 빠져도 지금 정렬 기준은 표시해 준다
+            elif active:
                 bar.append(f"{FOOTER_ON}·{FOOTER_TEXT}")
                 used += 1
-            bar.append("  ")
-            used += 2
+            bar.append(" " * gap)
+            used += gap
         bar.append(" " * max(0, cols - used))
         bar.append(RESET)
         out.append("".join(bar))
