@@ -1,0 +1,3 @@
+# cmd 는 줄 끝이 LF 인 배치 파일에서 goto·라벨을 잘못 찾는 일이 있다
+*.cmd text eol=crlf
+*.py text eol=lf
