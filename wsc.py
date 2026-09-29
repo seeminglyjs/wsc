@@ -8,6 +8,7 @@ tasklist·wmic·netstat 같은 외부 명령을 띄우지 않아 가볍고, 윈�
 """
 
 import argparse
+import collections
 import ctypes
 import os
 import re
@@ -28,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -57,8 +58,16 @@ CYAN = f"{ESC}[38;5;80m"
 GRAY = f"{ESC}[38;5;244m"
 HEADER_BG = f"{ESC}[48;5;238m{ESC}[38;5;255m"
 GRAY_ON_HEADER = f"{ESC}[22m{ESC}[38;5;250m"
-SELECT_BG = f"{ESC}[48;5;24m"
+LOGO_ON_HEADER = f"{ESC}[1m{ESC}[38;5;80m"
+# 고른 줄은 글자를 흰색 하나로 통일한다. 파란 바탕 위에 회색·초록 숫자는 잘 안 읽힌다
+SELECT_BG = f"{ESC}[48;5;24m{ESC}[38;5;255m"
 DANGER_BG = f"{ESC}[48;5;88m{ESC}[38;5;255m"
+# 압박 표시는 글자가 아니라 색 배지로 둔다. 평소엔 눈에 안 걸리고, 바뀌면 바로 보이게
+PRESSURE_BADGE = {
+    "여유": f"{ESC}[48;5;28m{ESC}[38;5;255m",
+    "주의": f"{ESC}[48;5;178m{ESC}[38;5;232m",
+    "위험": DANGER_BG,
+}
 # 맨 아래 조작 줄. 누르는 키는 자판처럼 밝게 도드라지고, 설명글은 차분하게 깔린다
 FOOTER_BG = f"{ESC}[48;5;236m{ESC}[38;5;250m"
 FOOTER_TEXT = f"{ESC}[22m{ESC}[38;5;250m"
@@ -75,12 +84,15 @@ PROTECTED_NAMES = {
 PROTECTED_PIDS = {0, 4}  # 0 은 유휴 프로세스, 4 는 커널(System)
 
 BLOCKS = "▏▎▍▌▋▊▉█"
+SPARKS = "▁▂▃▄▅▆▇█"
+SPARK_LEN = 20  # CPU 추이로 보여줄 최근 갱신 횟수
 
 # 옛 콘솔(conhost)을 한중일 코드 페이지로 쓰면 █ · … 같은 '폭이 애매한' 글자를
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
 ASCII_MAP = str.maketrans({
     "█": "#", "·": ".", "…": "~", "–": "-", "—": "-",
-    "›": ">", "↑": "^", "↓": "v",
+    "›": ">", "↑": "^", "↓": "v", "▼": "v",
+    "▁": "_", "▂": ".", "▃": ":", "▄": "-", "▅": "=", "▆": "+", "▇": "*",
 })
 USE_ASCII = False
 
@@ -473,17 +485,18 @@ def read_pagefile(page_size: int) -> tuple:
 
 
 def memory_pressure(mem: dict) -> tuple:
-    """(표시글, 색). 윈도우에는 맥 같은 압박 수준 값이 없어서 직접 판단한다.
+    """(표시글, 색, 덧붙일 말). 윈도우에는 맥 같은 압박 수준 값이 없어서 직접 판단한다.
 
     물리 메모리가 거의 찼거나, 커밋이 한계에 닿아가면 경고한다. 커밋이 한계에
     닿으면 페이지 파일이 늘어나지 못하는 한 새 프로그램이 메모리를 못 받는다.
+    덧붙일 말은 경고일 때만 있다. 평소에 늘 떠 있으면 눈이 무뎌져 정작 필요할 때 안 읽힌다
     """
     commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
     if mem["load"] >= 95 or commit_frac >= 0.95:
-        return ("위험", RED)
+        return ("위험", RED, "메모리가 바닥났다. 프로그램을 닫아야 한다")
     if mem["load"] >= 85 or commit_frac >= 0.85:
-        return ("주의", YELLOW)
-    return ("여유", GREEN)
+        return ("주의", YELLOW, "메모리가 빠듯하다. 안 쓰는 프로그램을 닫아 두면 좋다")
+    return ("여유", GREEN, "")
 
 
 # ── 프로세스 끝내기 ─────────────────────────────────────────────
@@ -588,6 +601,60 @@ def draw_bar(frac: float, width: int, color: str = "") -> str:
     return f"{color}{body}{RESET}{DIM}{'·' * empty}{RESET}"
 
 
+def draw_spark(values, width: int) -> str:
+    """최근 CPU% 를 ▁▂▃▅▇ 한 줄로. 눈금은 0~100% 고정이다.
+
+    가장 높은 값에 맞춰 늘리면 1~2% 흔들림도 산처럼 보여서 겁만 준다.
+    """
+    out = []
+    for v in list(values)[-width:]:
+        level = min(len(SPARKS) - 1, int(v / 100.0 * len(SPARKS)))
+        out.append(f"{level_color(v / 100.0)}{SPARKS[level]}")
+    return "".join(out) + RESET
+
+
+def proc_mem_color(private: int, total: int) -> str:
+    """프로세스 메모리 칸 색. 다 초록이면 정작 많이 먹는 게 안 보여서 작은 건 가라앉힌다."""
+    if private < 100 * 1024**2:
+        return GRAY
+    color = level_color(private / total * 4 if total else 0.0)  # 한 프로세스가 25% 먹으면 빨강
+    if color == GREEN and private < 1024**3:
+        return ""  # 1GB 밑은 기본 글자색. 초록은 눈여겨볼 만큼 큰 것에만 쓴다
+    return color
+
+
+def dim_ext(cell: str) -> str:
+    """이름 칸 끝의 .exe 를 흐리게. 거의 모든 줄에 붙어 있어 이름을 가린다."""
+    name = cell.rstrip(" ")
+    if not name.lower().endswith(".exe"):
+        return cell
+    return f"{name[:-4]}{GRAY}{name[-4:]}{RESET}{cell[len(name):]}"
+
+
+def fit_extras(head_w: int, extras: list, cols: int) -> tuple:
+    """요약 줄 뒤에 붙는 회색 정보를 창 폭에 맞춘다. (그릴 글자, 쓴 폭) 을 돌려준다.
+
+    extras 는 (글자, 색, 남길 순위). 넘치면 순위 낮은 것부터 하나씩 뺀다. 한꺼번에
+    접지 않는 건, 들어가는 한 가장 많이 보여주려는 것이다. 순위가 None 이면
+    경고라서 빼지 않고, 대신 남은 폭만큼 줄여 끝에 … 를 단다.
+    """
+    items = list(extras)
+    while head_w + sum(2 + dwidth(e[0]) for e in items) > cols:
+        droppable = [i for i, e in enumerate(items) if e[2] is not None]
+        if not droppable:
+            break
+        items.pop(min(droppable, key=lambda i: items[i][2]))
+    out, used = [], head_w
+    for text, color, _ in items:
+        room = cols - used - 2
+        if room < 4:
+            break
+        text = dtrunc(text, room)
+        out.append(f"  {color}{text}{RESET}")
+        used += 2 + dwidth(text)
+    return "".join(out), used
+
+
 # ── 화면 구성 ───────────────────────────────────────────────────
 class Monitor:
     def __init__(self, interval: float, sort_key: str):
@@ -598,6 +665,7 @@ class Monitor:
         self.prev_times = None
         self.rows = []
         self.total_cpu = 0.0
+        self.cpu_hist = collections.deque(maxlen=SPARK_LEN)  # 최근 전체 CPU%. 추이 그래프용
         self.ready = False
         # 수집 결과는 여기 담아둔다. 키를 눌러 다시 그릴 때 또 읽지 않으려는 것
         self.mem = dict(EMPTY_MEMORY)
@@ -650,6 +718,7 @@ class Monitor:
             busy_all = (times[1] - self.prev_times[1]) + (times[2] - self.prev_times[2])
             if busy_all > 0:
                 self.total_cpu = max(0.0, min(100.0, (busy_all - idle) / busy_all * 100.0))
+                self.cpu_hist.append(self.total_cpu)
                 self.ready = True
         self.prev_times = times
 
@@ -756,7 +825,7 @@ class Monitor:
         cols = max(52, cols)
         mem = self.mem
         page_used, page_total = self.pagefile
-        pressure_text, pressure_color = memory_pressure(mem)
+        pressure_text, pressure_color, pressure_note = memory_pressure(mem)
 
         bar_w = max(12, min(28, cols - 44))
         label_w = 7
@@ -782,76 +851,103 @@ class Monitor:
         pad = max(1, cols - dwidth(name) - dwidth(brand) - dwidth(right))
         admin_cell = f"{YELLOW}{BOLD}{admin}{RESET}{HEADER_BG}" if admin else ""
         out.append(
-            f"{HEADER_BG}{BOLD}{name}{RESET}{HEADER_BG}{brand}"
+            f"{HEADER_BG}{LOGO_ON_HEADER} wsc {GRAY_ON_HEADER}{VERSION}  {RESET}{HEADER_BG}{brand}"
             f"{' ' * pad}{admin_cell}{BOLD}{clock}{RESET}{HEADER_BG}  "
             f"{GRAY_ON_HEADER}갱신 {rate_color}{rate} {RESET}"
         )
         out.append("")
 
-        # CPU — 윈도우에는 부하 평균이 없어서 그 자리에 프로세스·스레드 수를 둔다
-        cpu_frac = self.total_cpu / 100.0
-        cpu_val = f"{self.total_cpu:5.1f}%" if self.ready else "  측정 중"
-        out.append(
-            f" {dpad('CPU', label_w)}{draw_bar(cpu_frac, bar_w)}  "
-            f"{BOLD}{cpu_val}{RESET}  {GRAY}{NCPU}코어  "
-            f"프로세스 {mem['processes']}  스레드 {mem['threads']}{RESET}"
-        )
+        # 값 칸은 '쓰는 양 / 전체' 두 칸으로 나눠 폭을 고정한다. 앞 숫자끼리 오른쪽 끝이 맞고,
+        # 뒤의 회색 정보도 한 세로줄에 선다. 자릿수가 바뀔 때마다 줄이 들썩이지도 않는다
+        values = {
+            "cpu": (f"{self.total_cpu:.1f}%" if self.ready else "측정 중", ""),
+            "mem": (human_bytes(mem["used"]), human_bytes(mem["total"])),
+            "commit": (human_bytes(mem["commit"]), human_bytes(mem["commit_limit"])),
+            "page": (
+                (human_bytes(page_used), human_bytes(page_total)) if page_total else ("꺼 둠", "")
+            ),
+        }
+        left_w = max(7, *(dwidth(v[0]) for v in values.values()))
+        right_w = max(7, *(dwidth(v[1]) for v in values.values()))
+        head_w = 1 + label_w + bar_w + 2 + left_w + 3 + right_w
 
-        # 메모리
-        mem_frac = mem["used"] / mem["total"] if mem["total"] else 0.0
-        out.append(
-            f" {dpad('메모리', label_w)}{draw_bar(mem_frac, bar_w)}  "
-            f"{BOLD}{human_bytes(mem['used'])} / {human_bytes(mem['total'])}{RESET}  "
-            f"{GRAY}압축 {human_bytes(self.compressed)}  "
-            f"캐시 {human_bytes(mem['cache'])}{RESET}"
+        def summary(label, frac, key, extras, color="", reserve=0):
+            used_text, total_text = values[key]
+            total_cell = f" / {dpad(total_text, right_w)}" if total_text else " " * (3 + right_w)
+            tail, used = fit_extras(head_w + reserve, extras, cols)
+            line = (
+                f" {dpad(label, label_w)}{draw_bar(frac, bar_w, color)}  "
+                f"{BOLD}{rpad(used_text, left_w)}{total_cell}{RESET}{tail}"
+            )
+            return line, used - reserve
+
+        # CPU — 윈도우에는 부하 평균이 없어서 그 자리에 프로세스·스레드 수를 둔다.
+        # 끝에는 최근 추이를 붙인다. 방금 튄 건지 계속 높은 건지가 한눈에 갈린다.
+        # 추이 자리를 먼저 떼어 두고, 남는 폭에 회색 정보를 순위대로 채운다
+        spark_room = 2 + 12 if len(self.cpu_hist) >= 2 else 0
+        line, used = summary(
+            "CPU", self.total_cpu / 100.0, "cpu",
+            [
+                (f"{NCPU}코어", GRAY, 3),
+                (f"프로세스 {mem['processes']}", GRAY, 2),
+                (f"스레드 {mem['threads']}", GRAY, 1),
+            ],
+            reserve=spark_room,
         )
+        spark_w = min(SPARK_LEN, cols - used - 2)
+        if spark_room and spark_w >= 8:
+            line += f"  {draw_spark(self.cpu_hist, spark_w)}"
+        out.append(line)
+
+        # 메모리. 좁으면 캐시부터 뺀다. 압축이 쌓이는 건 부족 신호라 더 오래 남긴다
+        mem_frac = mem["used"] / mem["total"] if mem["total"] else 0.0
+        out.append(summary(
+            "메모리", mem_frac, "mem",
+            [
+                (f"압축 {human_bytes(self.compressed)}", GRAY, 2),
+                (f"캐시 {human_bytes(mem['cache'])}", GRAY, 1),
+            ],
+        )[0])
 
         # 커밋 — 프로그램들이 '쓰겠다'고 받아간 메모리 총량. 한계에 닿으면 새 할당이 실패한다
         commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
-        commit_note = ""
+        commit_note = []
         if commit_frac >= 0.90:
-            commit_note = f"  {RED}{BOLD}한계 가까움 — 새 프로그램이 안 열릴 수 있다{RESET}"
+            commit_note = [("한계 가까움 — 새 프로그램이 안 열릴 수 있다", f"{RED}{BOLD}", None)]
         elif commit_frac >= 0.80:
-            commit_note = f"  {YELLOW}여유 적음{RESET}"
-        out.append(
-            f" {dpad('커밋', label_w)}{draw_bar(commit_frac, bar_w)}  "
-            f"{BOLD}{human_bytes(mem['commit'])} / {human_bytes(mem['commit_limit'])}{RESET}"
-            f"{commit_note}"
-        )
+            commit_note = [("여유 적음", YELLOW, None)]
+        out.append(summary("커밋", commit_frac, "commit", commit_note)[0])
 
         # 페이지 파일 — 맥의 스왑. 비율보다 절대량이 중요해서 색도 양으로 정한다
-        page_note = ""
+        page_note = []
         page_color = GREEN
         if page_used >= 3 * 1024**3:
             page_color = RED
-            page_note = f"  {RED}{BOLD}디스크로 많이 밀려남 — 렉의 주범{RESET}"
+            page_note = [("디스크로 많이 밀려남 — 렉의 주범", f"{RED}{BOLD}", None)]
         elif page_used >= 1024**3:
             page_color = YELLOW
-            page_note = f"  {YELLOW}메모리 부족 조짐{RESET}"
+            page_note = [("메모리 부족 조짐", YELLOW, None)]
         page_frac = page_used / page_total if page_total else 0.0
-        page_val = (
-            f"{human_bytes(page_used)} / {human_bytes(page_total)}"
-            if page_total
-            else "사용 안 함"
-        )
-        out.append(
-            f" {dpad('페이지', label_w)}{draw_bar(page_frac, bar_w, page_color)}  "
-            f"{BOLD}{page_val}{RESET}{page_note}"
-        )
+        out.append(summary("페이지", page_frac, "page", page_note, page_color)[0])
 
-        out.append(
-            f" {dpad('압박', label_w)}{pressure_color}{BOLD}{pressure_text}{RESET}  "
-            f"{GRAY}메모리와 커밋 기준. '위험'이면 프로그램을 닫아야 한다{RESET}"
-        )
+        # 압박 — 색 배지 하나로. 설명은 경고일 때만 붙인다
+        badge = f"{PRESSURE_BADGE[pressure_text]}{BOLD} {pressure_text} {RESET}"
+        line = f" {dpad('압박', label_w)}{badge}"
+        if pressure_note:
+            room = cols - (1 + label_w + dwidth(pressure_text) + 2 + 2)
+            line += f"  {pressure_color}{dtrunc(pressure_note, room)}{RESET}"
+        out.append(line)
         out.append("")
 
         # 프로세스 표
         # 포트 칸은 자리가 있을 때만 낸다. 좁은 창에서는 이름이 먼저다
         port_w = 9 if cols >= 76 else 0
-        name_w = max(14, cols - 34 - (port_w + 2 if port_w else 0))
+        # 이름 칸이 창 끝까지 간다. 제목 줄·조작 줄과 오른쪽 끝이 맞아야 표가 반듯해 보인다
+        name_w = max(14, cols - 29 - (port_w + 2 if port_w else 0))
         # 색 코드는 폭 계산 뒤에 감싼다. 안 그러면 이스케이프 문자까지 폭으로 세서 표가 어긋난다
-        cpu_hdr = rpad("CPU%", 7)
-        mem_hdr = rpad("메모리", 8)
+        # 정렬 기준 칸에는 ▼ 를 붙인다. 굵은 글씨만으로는 어느 쪽인지 잘 안 보인다
+        cpu_hdr = rpad("CPU%▼" if self.sort_key == "cpu" else "CPU%", 7)
+        mem_hdr = rpad("메모리▼" if self.sort_key == "mem" else "메모리", 8)
         if self.sort_key == "cpu":
             cpu_hdr = f"{BOLD}{cpu_hdr}{RESET}{HEADER_BG}"
         else:
@@ -883,25 +979,27 @@ class Monitor:
             last_row = idx == len(window) - 1
             col_w = max(6, name_w - dwidth(count_note)) if last_row else name_w
             chosen = pid == self.selected_pid
-            pct_color = proc_cpu_color(pct)
-            mem_share = private / mem["total"] if mem["total"] else 0.0
-            mem_color = level_color(mem_share * 4)  # 한 프로세스가 25% 먹으면 빨강
-            mark = "›" if chosen else " "
-            port_cell = ""
-            if port_w:
-                port_text = format_ports(self.ports.get(pid, []))
-                port_color = CYAN if port_text else DIM
-                port_cell = (
-                    f"{port_color}{dpad(port_text, port_w)}{RESET}"
-                    f"{SELECT_BG if chosen else ''}  "
+            port_text = format_ports(self.ports.get(pid, [])) if port_w else ""
+            name_cell = dpad(name, col_w)
+            if chosen:
+                # 고른 줄은 색을 다 빼고 흰 글씨 하나로. 파란 바탕 위 색 글자는 안 읽힌다
+                port_cell = f"{dpad(port_text, port_w)}  " if port_w else ""
+                body = (
+                    f"›{pid:>7}  {pct:>7.1f}  {human_bytes(private):>8}  "
+                    f"{port_cell}{name_cell}"
                 )
-            body = (
-                f"{mark}{pid:>7}  {pct_color}{pct:>7.1f}{RESET}"
-                f"{SELECT_BG if chosen else ''}  "
-                f"{mem_color}{human_bytes(private):>8}{RESET}"
-                f"{SELECT_BG if chosen else ''}  {port_cell}{dpad(name, col_w)}"
-            )
-            line = f"{SELECT_BG}{BOLD}{body}{RESET}" if chosen else body
+                line = f"{SELECT_BG}{BOLD}{body}{RESET}"
+            else:
+                port_cell = ""
+                if port_w:
+                    port_color = CYAN if port_text else DIM
+                    port_cell = f"{port_color}{dpad(port_text, port_w)}{RESET}  "
+                mem_color = proc_mem_color(private, mem["total"])
+                line = (
+                    f" {pid:>7}  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
+                    f"{mem_color}{human_bytes(private):>8}{RESET}  "
+                    f"{port_cell}{dim_ext(name_cell)}"
+                )
             if last_row and count_note:
                 line += f"{GRAY}{count_note}{RESET}"
             out.append(line)
