@@ -23,13 +23,13 @@ import urllib.error
 import urllib.request
 
 if sys.platform != "win32":
-    sys.exit("wsc 는 윈도우 전용이다. 맥이라면 msc 를 써라: https://github.com/seeminglyjs/msc")
+    sys.exit("wsc 는 Windows 전용입니다. macOS 에서는 msc 를 쓰세요: https://github.com/seeminglyjs/msc")
 
 import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 뒤에 불러온다
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -258,6 +258,10 @@ iphlpapi.GetExtendedTcpTable.argtypes = [
     wintypes.ULONG, ctypes.c_int, wintypes.ULONG,
 ]
 iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
+iphlpapi.GetIfTable2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+iphlpapi.GetIfTable2.restype = wintypes.DWORD
+iphlpapi.FreeMibTable.argtypes = [ctypes.c_void_p]
+iphlpapi.FreeMibTable.restype = None
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
@@ -282,6 +286,15 @@ WM_CLOSE = 0x0010
 GW_OWNER = 4
 AF_INET, AF_INET6 = 2, 23
 TCP_TABLE_OWNER_PID_LISTENER = 3
+# MIB_IF_ROW2 한 줄의 크기와, 쓰는 칸의 위치(바이트). 구조가 커서 필요한 칸만 꺼내 읽는다
+IF_ROW2_SIZE = 1352
+IF_ALIAS_AT, IF_ALIAS_LEN = 28, 514
+IF_TYPE_AT = 1128
+IF_FLAGS_AT = 1152  # 첫 비트가 실제 장치, 둘째 비트가 필터 드라이버
+IF_STATE_AT = 1156  # 동작 상태, 관리 상태, 연결 상태가 차례로 있다
+IF_SPEED_AT = 1192  # 보내기·받기 링크 속도(bps), 바로 뒤에 받은 바이트
+IF_OUT_OCTETS_AT = 1280
+IF_TYPE_LOOPBACK = 24
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 STD_OUTPUT_HANDLE = -11 & 0xFFFFFFFF
 
@@ -425,6 +438,40 @@ def sample_ports() -> dict:
     return {pid: sorted(ports) for pid, ports in found.items()}
 
 
+def sample_network() -> dict:
+    """{LUID: (받은 바이트, 보낸 바이트, 받기 링크 bps, 보내기 링크 bps, 이름)} — 연결된 실제 장치만.
+
+    인터페이스 목록에는 같은 랜카드가 필터 드라이버(방화벽·QoS)마다 한 번씩 더 나오고,
+    WSL·Hyper-V 의 가상 어댑터도 있다. 가상 어댑터를 지나는 트래픽은 결국 실제 랜카드로도
+    나가서, 다 더하면 같은 바이트를 두 번 세게 된다. 그래서 실제 장치만 더한다.
+    """
+    table = ctypes.c_void_p()
+    if iphlpapi.GetIfTable2(ctypes.byref(table)) != 0 or not table.value:
+        return {}
+    found = {}
+    try:
+        count = ctypes.c_ulong.from_address(table.value).value
+        for i in range(count):
+            # 표 머리의 개수 칸 뒤로 8바이트 정렬을 맞춰 줄이 이어진다
+            row = ctypes.string_at(table.value + 8 + i * IF_ROW2_SIZE, IF_ROW2_SIZE)
+            flags = row[IF_FLAGS_AT]
+            oper, _, media = struct.unpack_from("<III", row, IF_STATE_AT)
+            if_type = struct.unpack_from("<I", row, IF_TYPE_AT)[0]
+            # 실제 장치이고, 필터가 아니고, 켜져서 연결된 것만
+            if not flags & 1 or flags & 2 or oper != 1 or media != 1:
+                continue
+            if if_type == IF_TYPE_LOOPBACK:
+                continue
+            tx_speed, rx_speed, rx_bytes = struct.unpack_from("<QQQ", row, IF_SPEED_AT)
+            tx_bytes = struct.unpack_from("<Q", row, IF_OUT_OCTETS_AT)[0]
+            alias = row[IF_ALIAS_AT : IF_ALIAS_AT + IF_ALIAS_LEN].decode("utf-16-le", "replace")
+            luid = struct.unpack_from("<Q", row, 0)[0]
+            found[luid] = (rx_bytes, tx_bytes, rx_speed, tx_speed, alias.split("\0")[0])
+    finally:
+        iphlpapi.FreeMibTable(table)
+    return found
+
+
 def format_ports(ports: list) -> str:
     """가장 작은 포트 하나만 적고, 더 잡고 있으면 `+N` 으로 줄인다."""
     if not ports:
@@ -492,13 +539,20 @@ def memory_pressure(mem: dict) -> tuple:
 
     물리 메모리가 거의 찼거나, 커밋이 한계에 닿아가면 경고한다. 커밋이 한계에
     닿으면 페이지 파일이 늘어나지 못하는 한 새 프로그램이 메모리를 못 받는다.
-    덧붙일 말은 경고일 때만 있다. 평소에 늘 떠 있으면 눈이 무뎌져 정작 필요할 때 안 읽힌다
+    덧붙일 말은 경고일 때만 있다. 평소에 늘 떠 있으면 눈이 무뎌져 정작 필요할 때 안 읽힌다.
+    무엇이 기준을 넘었는지 숫자로 밝히고, 바로 할 수 있는 일을 키와 함께 적는다
     """
-    commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
-    if mem["load"] >= 95 or commit_frac >= 0.95:
-        return ("위험", RED, "메모리가 바닥났다. 프로그램을 닫아야 한다")
-    if mem["load"] >= 85 or commit_frac >= 0.85:
-        return ("주의", YELLOW, "메모리가 빠듯하다. 안 쓰는 프로그램을 닫아 두면 좋다")
+    commit_pct = mem["commit"] / mem["commit_limit"] * 100 if mem["commit_limit"] else 0.0
+    # 둘 중 더 높은 쪽이 판단 근거다
+    if commit_pct > mem["load"]:
+        reason = f"커밋 {commit_pct:.0f}%"
+    else:
+        reason = f"사용률 {mem['load']}%"
+    worst = max(mem["load"], commit_pct)
+    if worst >= 95:
+        return ("위험", RED, f"{reason} — 새 프로그램이 안 열리거나 멈출 수 있음. m 정렬 후 큰 것부터 종료")
+    if worst >= 85:
+        return ("주의", YELLOW, f"{reason} — m 으로 메모리순 정렬해 안 쓰는 프로그램 정리 권장")
     return ("여유", GREEN, "")
 
 
@@ -569,6 +623,26 @@ def human_bytes(n: float) -> str:
     if n >= 1024:
         return f"{n / 1024:.0f}KB"
     return f"{int(n)}B"
+
+
+def human_rate(n: float) -> str:
+    """초당 바이트. 폭이 8칸을 넘지 않게 자릿수를 맞춘다. 숫자가 바뀔 때 줄이 들썩이지 않게."""
+    if n >= 1024**3:
+        return f"{n / 1024**3:.1f}GB/s"
+    if n >= 100 * 1024**2:
+        return f"{n / 1024**2:.0f}MB/s"
+    if n >= 1024**2:
+        return f"{n / 1024**2:.1f}MB/s"
+    if n >= 1024:
+        return f"{n / 1024:.0f}KB/s"
+    return f"{int(n)}B/s"
+
+
+def human_bps(bits: int) -> str:
+    """링크 속도. 랜카드·공유기 표기처럼 비트 단위·1000 배수로 적는다."""
+    if bits >= 10**9:
+        return f"{bits / 10**9:.1f}".rstrip("0").rstrip(".") + "Gbps"
+    return f"{bits / 10**6:.0f}Mbps"
 
 
 def level_color(frac: float) -> str:
@@ -675,6 +749,9 @@ class Monitor:
         self.mem = dict(EMPTY_MEMORY)
         self.pagefile = (0, 0)
         self.compressed = 0
+        self.net_prev = {}  # 지난번 인터페이스별 누적 바이트. 차이로 속도를 낸다
+        self.net_rate = None  # (받기, 보내기) 초당 바이트. 두 번 재기 전엔 None
+        self.net_links = []  # [(이름, 받기 bps, 보내기 bps)] 지금 연결된 실제 장치
         self.interval_changed_at = 0.0  # 주기를 바꾼 직후 잠깐 강조하려고 기록
         self.latest_version = ""  # 새 버전 확인 결과. 별도 흐름에서 채운다
         # 프로세스 고르기와 종료 관련
@@ -713,6 +790,7 @@ class Monitor:
         self.ports = sample_ports()  # API 로 바로 읽어서 수 밀리초면 끝난다. 따로 돌릴 필요 없다
         self.mem = read_memory()
         self.pagefile = read_pagefile(self.mem["page_size"])
+        net = sample_network()
 
         # 전체 CPU 는 시스템 누적 시간으로 잰다. 프로세스를 더하는 방식은 인터럽트 처리
         # 시간을 놓치고, 재는 사이 끝난 프로세스 몫도 빠진다
@@ -747,6 +825,18 @@ class Monitor:
         if elapsed > 0:
             listed = sum(r[1] for r in rows)
             self.unlisted_cpu = max(0.0, self.total_cpu - listed)
+
+        # 네트워크 속도. 어댑터를 새로 꽂았거나 재시작해서 수가 줄었으면 그 어댑터는 이번에 뺀다
+        if elapsed > 0:
+            down = up = 0
+            for luid, (rx, tx, *_) in net.items():
+                before = self.net_prev.get(luid)
+                if before and rx >= before[0] and tx >= before[1]:
+                    down += rx - before[0]
+                    up += tx - before[1]
+            self.net_rate = (down / elapsed, up / elapsed)
+        self.net_prev = net
+        self.net_links = [(n[4], n[2], n[3]) for n in net.values()]
 
         self.compressed = compressed
         self.rows = rows
@@ -783,14 +873,14 @@ class Monitor:
         rows = self.sorted_rows()
         target = next((r for r in rows if r[0] == self.selected_pid), None)
         if target is None:
-            self.set_status("먼저 ↑ ↓ 로 프로세스를 고르라", YELLOW)
+            self.set_status("종료할 프로세스를 ↑↓ 로 먼저 선택", YELLOW)
             return
         pid, _, _, name = target
         if pid in PROTECTED_PIDS or name.lower() in PROTECTED_NAMES:
-            self.set_status(f"{name} 은 윈도우가 돌아가는 데 필요하다. 종료 못 한다", RED)
+            self.set_status(f"{name} — Windows 핵심 프로세스라 종료 불가 (끄면 블루스크린·재시동)", RED)
             return
         if pid == os.getpid():
-            self.set_status("wsc 자신이다. 끄려면 q 를 눌러라", YELLOW)
+            self.set_status("wsc 자신은 여기서 종료 불가 — q 로 나가기", YELLOW)
             return
         born = self.prev.get(pid, (None,))[0]
         self.pending_kill = (pid, name, born)
@@ -801,34 +891,35 @@ class Monitor:
         # 확인을 기다리는 사이 그 프로세스가 끝나고 같은 PID 로 딴 게 떴을 수 있다.
         # 그걸 엉뚱하게 죽이지 않도록 방금 읽은 목록으로 다시 맞춰본다
         fresh = sample_processes().get(pid)
+        who = f"{name} (PID {pid})"
         if fresh is None or fresh[0] != born:
-            self.set_status(f"PID {pid} {name} 은 이미 없다", GRAY)
+            self.set_status(f"{who} — 이미 종료됨", GRAY)
             self.needs_refresh = True
             return
         try:
             if force:
                 terminate(pid)
-                how = "강제 종료함"
+                how = "강제 종료 완료"
             else:
                 sent = close_windows(pid)
                 if not sent:
                     self.set_status(
-                        f"PID {pid} {name} 은 닫을 창이 없다. 끝내려면 k 다음 f 로 강제 종료",
+                        f"{who} — 닫을 창이 없는 프로세스. 끝내려면 k 다음 f (강제 종료)",
                         YELLOW,
                     )
                     return
-                how = "창 닫기 요청 보냄"
+                how = "창 닫기 요청 보냄. 저장 여부를 묻는 창이 떴을 수 있음"
         except ProcessLookupError:
-            self.set_status(f"PID {pid} {name} 은 이미 없다", GRAY)
+            self.set_status(f"{who} — 이미 종료됨", GRAY)
         except PermissionError:
             self.set_status(
-                f"PID {pid} {name} 종료 권한이 없다. 관리자 권한 터미널에서 wsc 를 띄워야 한다",
+                f"{who} — 권한 부족. 관리자 권한 터미널에서 wsc 를 실행해야 종료 가능",
                 RED,
             )
         except OSError as exc:
-            self.set_status(f"PID {pid} {name} 종료 실패 ({exc})", RED)
+            self.set_status(f"{who} — 종료 실패 ({exc})", RED)
         else:
-            self.set_status(f"PID {pid} {name} {how}", GREEN)
+            self.set_status(f"{who} — {how}", GREEN)
             self.needs_refresh = True
 
     def render(self, cols: int, lines: int) -> list:
@@ -837,8 +928,8 @@ class Monitor:
         page_used, page_total = self.pagefile
         pressure_text, pressure_color, pressure_note = memory_pressure(mem)
 
-        bar_w = max(12, min(28, cols - 44))
-        label_w = 7
+        bar_w = max(12, min(28, cols - 50))
+        label_w = 9  # '네트워크' 가 8칸이다
         out = []
 
         # 제목 줄
@@ -877,13 +968,20 @@ class Monitor:
                 (human_bytes(page_used), human_bytes(page_total)) if page_total else ("꺼 둠", "")
             ),
         }
-        left_w = max(7, *(dwidth(v[0]) for v in values.values()))
-        right_w = max(7, *(dwidth(v[1]) for v in values.values()))
+        if not self.net_links:
+            values["net"] = ("연결 없음", "")
+        elif self.net_rate is None:
+            values["net"] = ("측정 중", "")
+        else:
+            values["net"] = (f"↓{human_rate(self.net_rate[0])}", f"↑{human_rate(self.net_rate[1])}")
+        # 네트워크 속도는 늘 자릿수가 바뀐다. 가장 긴 모양(↓12.3MB/s)에 맞춰 폭을 고정해 둔다
+        left_w = max(9, *(dwidth(v[0]) for v in values.values()))
+        right_w = max(9, *(dwidth(v[1]) for v in values.values()))
         head_w = 1 + label_w + bar_w + 2 + left_w + 3 + right_w
 
-        def summary(label, frac, key, extras, color="", reserve=0):
+        def summary(label, frac, key, extras, color="", reserve=0, sep=" / "):
             used_text, total_text = values[key]
-            total_cell = f" / {dpad(total_text, right_w)}" if total_text else " " * (3 + right_w)
+            total_cell = f"{sep}{dpad(total_text, right_w)}" if total_text else " " * (3 + right_w)
             tail, used = fit_extras(head_w + reserve, extras, cols)
             line = (
                 f" {dpad(label, label_w)}{draw_bar(frac, bar_w, color)}  "
@@ -900,12 +998,19 @@ class Monitor:
             (f"프로세스 {mem['processes']}", GRAY, 2),
             (f"스레드 {mem['threads']}", GRAY, 1),
         ]
-        # 목록으로 설명 안 되는 몫이 크면 맨 앞에 경고로 둔다. 표를 뒤져도 범인이 없는 이유다
-        # 좁아서 둘 다 못 넣으면 추이를 접는다. 이 경고는 표를 아무리 봐도 대신 알 길이 없다
+        # 표의 프로세스로 설명 안 되는 몫이 크면 맨 앞에 경고로 둔다. 표를 뒤져도 범인이 없는 이유다.
+        # 숫자만 띄우면 무슨 뜻인지 모르니, 자리가 있으면 흔한 원인을 회색으로 붙인다.
+        # 좁아서 경고·원인과 추이를 다 못 넣으면 추이를 접는다. 이건 표를 봐서는 대신 알 길이 없다.
+        # 숫자를 앞에 둔다. 좁은 창에서 끝이 잘려도 몇 % 인지는 남게
         if self.ready and self.unlisted_cpu >= UNLISTED_WARN:
-            warn = f"목록 밖 {self.unlisted_cpu:.0f}%"
+            warn = f"{self.unlisted_cpu:.0f}%는 표에 없음"
+            hint = "(잠깐 뜬 프로세스·드라이버·VM 몫)"
             cpu_extras.insert(0, (warn, YELLOW, None))
-            if head_w + 2 + dwidth(warn) + spark_room > cols:
+            cpu_extras.insert(1, (hint, GRAY, 4))
+            with_warn = head_w + 2 + dwidth(warn)
+            with_hint = with_warn + 2 + dwidth(hint)
+            # 추이를 접어서 원인까지 들어갈 때만 접는다. 접어도 안 들어가면 추이를 남긴다
+            if with_hint + spark_room > cols >= with_hint or with_warn + spark_room > cols:
                 spark_room = 0
         line, used = summary(
             "CPU", self.total_cpu / 100.0, "cpu", cpu_extras, reserve=spark_room,
@@ -928,10 +1033,14 @@ class Monitor:
         # 커밋 — 프로그램들이 '쓰겠다'고 받아간 메모리 총량. 한계에 닿으면 새 할당이 실패한다
         commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
         commit_note = []
+        # 비율보다 '얼마 남았나' 가 와닿는다
+        commit_left = human_bytes(max(0, mem["commit_limit"] - mem["commit"]))
         if commit_frac >= 0.90:
-            commit_note = [("한계 가까움 — 새 프로그램이 안 열릴 수 있다", f"{RED}{BOLD}", None)]
+            commit_note = [
+                (f"한계까지 {commit_left} — 새 프로그램 실행이 실패할 수 있음", f"{RED}{BOLD}", None)
+            ]
         elif commit_frac >= 0.80:
-            commit_note = [("여유 적음", YELLOW, None)]
+            commit_note = [(f"한계까지 {commit_left} 남음", YELLOW, None)]
         out.append(summary("커밋", commit_frac, "commit", commit_note)[0])
 
         # 페이지 파일 — 맥의 스왑. 비율보다 절대량이 중요해서 색도 양으로 정한다
@@ -939,10 +1048,10 @@ class Monitor:
         page_color = GREEN
         if page_used >= 3 * 1024**3:
             page_color = RED
-            page_note = [("디스크로 많이 밀려남 — 렉의 주범", f"{RED}{BOLD}", None)]
+            page_note = [("버벅임 주원인 — 메모리가 디스크로 많이 밀려남", f"{RED}{BOLD}", None)]
         elif page_used >= 1024**3:
             page_color = YELLOW
-            page_note = [("메모리 부족 조짐", YELLOW, None)]
+            page_note = [("메모리 부족 조짐 — 디스크로 밀려나기 시작", YELLOW, None)]
         page_frac = page_used / page_total if page_total else 0.0
         out.append(summary("페이지", page_frac, "page", page_note, page_color)[0])
 
@@ -953,6 +1062,27 @@ class Monitor:
             room = cols - (1 + label_w + dwidth(pressure_text) + 2 + 2)
             line += f"  {pressure_color}{dtrunc(pressure_note, room)}{RESET}"
         out.append(line)
+
+        # 네트워크 — 막대는 회선(링크 속도) 대비 얼마나 쓰고 있나. 받기·보내기 중 큰 쪽으로 그린다.
+        # 프로세스별 사용량은 윈도우가 관리자 권한 없이는 알려주지 않아서 전체만 보인다
+        net_frac = 0.0
+        net_extras = []
+        if self.net_links:
+            rx_link = sum(link[1] for link in self.net_links)
+            tx_link = sum(link[2] for link in self.net_links)
+            if self.net_rate:
+                down, up = self.net_rate
+                net_frac = max(
+                    down * 8 / rx_link if rx_link else 0.0,
+                    up * 8 / tx_link if tx_link else 0.0,
+                )
+            if net_frac >= 0.85:
+                net_extras.append(("회선이 거의 가득 참 — 내려받기·화상회의가 느려질 수 있음", YELLOW, None))
+            first = self.net_links[0]
+            name = first[0] if len(self.net_links) == 1 else f"{first[0]} 외 {len(self.net_links) - 1}"
+            net_extras.append((name, GRAY, 1))
+            net_extras.append((f"회선 {human_bps(max(rx_link, tx_link))}", GRAY, 2))
+        out.append(summary("네트워크", net_frac, "net", net_extras, sep="   ")[0])
         out.append("")
 
         # 프로세스 표
@@ -1026,7 +1156,7 @@ class Monitor:
             out.append(f"{color} {dtrunc(text, cols - 2)}{RESET}")
         elif self.update_ready:
             # 알릴 말이 없을 때만. 조작 줄에 끼워 넣으면 '누를 것'과 섞여 헷갈린다
-            note = f"새 버전 {self.latest_version} 이 있다 — 끄고 wsc --update"
+            note = f"새 버전 {self.latest_version} 나옴 — q 로 나간 뒤 wsc --update"
             out.append(f"{CYAN}{BOLD} {dtrunc(note, cols - 2)}{RESET}")
         else:
             out.append("")
@@ -1037,7 +1167,7 @@ class Monitor:
             for key, label in (("y", "창 닫기"), ("f", "강제"), ("n", "취소")):
                 keys += f"{KEY_BG}{BOLD} {key} {RESET}{DANGER_BG}{BOLD} {label}  "
                 keys_w += dwidth(key) + dwidth(label) + 5
-            question = f" {dtrunc(name, max(10, cols - keys_w - 22))} (PID {pid}) 를 종료한다"
+            question = f" 종료 확인: {dtrunc(name, max(10, cols - keys_w - 24))} (PID {pid})"
             out.append(
                 f"{DANGER_BG}{BOLD}{dpad(question, max(1, cols - keys_w))}{keys}{RESET}"
             )
@@ -1112,7 +1242,7 @@ class Monitor:
             else:
                 pid, name, _ = self.pending_kill
                 self.pending_kill = None
-                self.set_status(f"PID {pid} {name} 종료를 취소했다", GRAY)
+                self.set_status(f"{name} (PID {pid}) 종료 취소", GRAY)
             return True
 
         if key in ("q", "Q", "\x03", "\x04"):
@@ -1272,8 +1402,8 @@ def run_interactive(monitor: Monitor) -> int:
     saved_mode = enable_vt()
     if saved_mode is None:
         print(
-            "이 콘솔은 화면 제어 문자를 못 알아듣는다. "
-            "Windows 10 이상에서 Windows Terminal 로 실행해라.",
+            "이 콘솔은 화면 제어 문자(ANSI)를 지원하지 않습니다. "
+            "Windows 10 이상에서 Windows Terminal 로 실행하세요.",
             file=sys.stderr,
         )
         return 1
@@ -1429,16 +1559,16 @@ def self_update(check_only: bool = False) -> int:
         with open_raw(20) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as exc:
-        print(f"\n실패: 서버가 {exc.code} 로 거절했다. 레포가 비공개거나 주소가 바뀌었다.")
+        print(f"\n실패: 서버가 요청을 거절했습니다 (HTTP {exc.code}). 저장소가 비공개로 바뀌었거나 주소가 달라졌을 수 있습니다.")
         return 1
     except Exception as exc:
-        print(f"\n실패: 내려받지 못했다 ({exc}). 인터넷 연결을 확인해라.")
+        print(f"\n실패: 내려받지 못했습니다 ({exc}). 인터넷 연결을 확인하세요.")
         return 1
 
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
-        print("\n실패: 받은 파일이 깨져 있다.")
+        print("\n실패: 받은 파일이 손상되어 있습니다. 잠시 뒤 다시 시도하세요.")
         return 1
 
     found = re.search(r'^VERSION = "([^"]+)"', text, re.M)
@@ -1450,24 +1580,24 @@ def self_update(check_only: bool = False) -> int:
 
     # 깃이 줄 끝을 CRLF 로 바꿔 받았을 수 있다. 줄 끝만 다른 건 같은 파일로 본다
     if current.replace(b"\r\n", b"\n") == payload.replace(b"\r\n", b"\n"):
-        print("\n이미 최신이다. 받을 것 없음.")
+        print("\n이미 최신 버전입니다.")
         return 0
     if not latest:
-        print("\n받은 파일에 버전 표시가 없다. 안전하게 덮어쓰지 않는다.")
-        print(f"직접 확인해라: {REPO_URL}")
+        print("\n받은 파일에 버전 정보가 없어 안전을 위해 덮어쓰지 않았습니다.")
+        print(f"직접 확인하세요: {REPO_URL}")
         return 1
     if parse_version(latest) < parse_version(VERSION):
-        print(f"\n서버 쪽이 더 낮다 ({latest} < {VERSION}). 덮어쓰지 않는다.")
+        print(f"\n서버 버전이 더 낮아 덮어쓰지 않았습니다 ({latest} < {VERSION}).")
         return 1
     if check_only:
-        print(f"\n새 버전 {latest} 이 있다. 받으려면: wsc --update")
+        print(f"\n새 버전 {latest} 이 나왔습니다. 설치하려면: wsc --update")
         return 0
 
     # 문법이 깨진 파일로 덮어쓰면 프로그램이 아예 안 열린다. 미리 검사한다
     try:
         compile(text, target, "exec")
     except SyntaxError as exc:
-        print(f"\n실패: 받은 파일에 문법 오류가 있다 ({exc}). 덮어쓰지 않는다.")
+        print(f"\n실패: 받은 파일에 문법 오류가 있어 덮어쓰지 않았습니다 ({exc}).")
         return 1
 
     folder = os.path.dirname(target)
@@ -1481,15 +1611,15 @@ def self_update(check_only: bool = False) -> int:
             fp.write(current)
         os.replace(temp, target)
     except PermissionError:
-        print(f"\n실패: {target} 에 쓸 권한이 없다.")
-        print("시작 메뉴에서 터미널을 '관리자 권한으로 실행'한 뒤 다시 해라.")
+        print(f"\n실패: {target} 에 쓸 권한이 없습니다.")
+        print("시작 메뉴에서 터미널을 '관리자 권한으로 실행'한 뒤 다시 시도하세요.")
         return 1
     except OSError as exc:
-        print(f"\n실패: 파일을 바꾸지 못했다 ({exc}).")
+        print(f"\n실패: 파일을 바꾸지 못했습니다 ({exc}).")
         return 1
 
-    print(f"\n{VERSION} → {latest} 로 바꿨다.")
-    print(f"이전 버전은 {backup} 에 남겨뒀다. 문제 없으면 지워도 된다.")
+    print(f"\n{VERSION} → {latest} 갱신 완료.")
+    print(f"이전 버전은 {backup} 에 백업했습니다. 문제가 없으면 지워도 됩니다.")
     return 0
 
 
@@ -1498,7 +1628,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="wsc",
-        description="윈도우 CPU·메모리 사용량과 많이 먹는 프로세스를 터미널에 보여준다.",
+        description="Windows 의 CPU·메모리·네트워크 사용량과 자원을 많이 쓰는 프로세스를 터미널에 보여줍니다.",
     )
     parser.add_argument(
         "-i", "--interval", type=float, default=2.0, help="갱신 주기(초). 기본 2.0"
@@ -1521,7 +1651,7 @@ def main():
         "-u", "--update", action="store_true", help="깃허브에서 최신 버전으로 갱신"
     )
     parser.add_argument(
-        "--check-update", action="store_true", help="갱신할 게 있는지 확인만 한다"
+        "--check-update", action="store_true", help="새 버전이 있는지 확인만 한다 (설치하지 않음)"
     )
     parser.add_argument(
         "-v", "--version", action="version", version=f"wsc {VERSION}  {REPO_URL}"
