@@ -29,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -86,6 +86,9 @@ PROTECTED_PIDS = {0, 4}  # 0 은 유휴 프로세스, 4 는 커널(System)
 BLOCKS = "▏▎▍▌▋▊▉█"
 SPARKS = "▁▂▃▄▅▆▇█"
 SPARK_LEN = 20  # CPU 추이로 보여줄 최근 갱신 횟수
+# 전체 CPU 에서 프로세스 몫을 뺀 나머지가 이만큼(%p) 넘으면 CPU 줄에 띄운다. 평소에도
+# 인터럽트 처리 같은 게 몇 %p 는 남아서, 그보다 확실히 클 때만 보이게 한다
+UNLISTED_WARN = 10.0
 
 # 옛 콘솔(conhost)을 한중일 코드 페이지로 쓰면 █ · … 같은 '폭이 애매한' 글자를
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
@@ -665,6 +668,7 @@ class Monitor:
         self.prev_times = None
         self.rows = []
         self.total_cpu = 0.0
+        self.unlisted_cpu = 0.0  # 전체 CPU 중 목록의 어느 프로세스에도 안 잡힌 몫
         self.cpu_hist = collections.deque(maxlen=SPARK_LEN)  # 최근 전체 CPU%. 추이 그래프용
         self.ready = False
         # 수집 결과는 여기 담아둔다. 키를 눌러 다시 그릴 때 또 읽지 않으려는 것
@@ -737,6 +741,12 @@ class Monitor:
             if name == "Memory Compression":
                 compressed = ws  # 압축해 담아둔 메모리는 이 프로세스의 작업 집합으로 잡힌다
             rows.append((pid, pct, private, name))
+
+        # 전체 CPU 가 튀었는데 목록에 범인이 없을 때가 있다. 갱신 사이에 생겼다 끝난 짧은
+        # 프로세스, 드라이버의 인터럽트 처리, 가상 머신 몫은 프로세스별 시간에 안 잡힌다
+        if elapsed > 0:
+            listed = sum(r[1] for r in rows)
+            self.unlisted_cpu = max(0.0, self.total_cpu - listed)
 
         self.compressed = compressed
         self.rows = rows
@@ -885,14 +895,20 @@ class Monitor:
         # 끝에는 최근 추이를 붙인다. 방금 튄 건지 계속 높은 건지가 한눈에 갈린다.
         # 추이 자리를 먼저 떼어 두고, 남는 폭에 회색 정보를 순위대로 채운다
         spark_room = 2 + 12 if len(self.cpu_hist) >= 2 else 0
+        cpu_extras = [
+            (f"{NCPU}코어", GRAY, 3),
+            (f"프로세스 {mem['processes']}", GRAY, 2),
+            (f"스레드 {mem['threads']}", GRAY, 1),
+        ]
+        # 목록으로 설명 안 되는 몫이 크면 맨 앞에 경고로 둔다. 표를 뒤져도 범인이 없는 이유다
+        # 좁아서 둘 다 못 넣으면 추이를 접는다. 이 경고는 표를 아무리 봐도 대신 알 길이 없다
+        if self.ready and self.unlisted_cpu >= UNLISTED_WARN:
+            warn = f"목록 밖 {self.unlisted_cpu:.0f}%"
+            cpu_extras.insert(0, (warn, YELLOW, None))
+            if head_w + 2 + dwidth(warn) + spark_room > cols:
+                spark_room = 0
         line, used = summary(
-            "CPU", self.total_cpu / 100.0, "cpu",
-            [
-                (f"{NCPU}코어", GRAY, 3),
-                (f"프로세스 {mem['processes']}", GRAY, 2),
-                (f"스레드 {mem['threads']}", GRAY, 1),
-            ],
-            reserve=spark_room,
+            "CPU", self.total_cpu / 100.0, "cpu", cpu_extras, reserve=spark_room,
         )
         spark_w = min(SPARK_LEN, cols - used - 2)
         if spark_room and spark_w >= 8:
