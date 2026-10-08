@@ -10,6 +10,7 @@ tasklist·wmic·netstat 같은 외부 명령을 띄우지 않아 가볍고, 윈�
 import argparse
 import collections
 import ctypes
+import math
 import os
 import re
 import signal
@@ -29,7 +30,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -109,7 +110,10 @@ BAR_DIM_START = 0.55  # 막대 첫 칸의 밝기. 끝으로 갈수록 밝아져�
 # 메모리 막대에서 사용 중 뒤에 잇는 캐시 몫. 차분한 파랑이라 '쓰는 중' 과 갈린다.
 # 메모리 줄 옆의 '캐시 N GB' 글자도 같은 색으로 칠해 범례 노릇을 하게 한다
 CACHE_COLOR = f"{ESC}[38;2;74;120;160m"
-CORE_BUSY = 90.0  # 코어 하나가 이만큼 넘게 바쁜데 전체 CPU 는 낮으면 한 스레드 병목으로 본다
+# 네트워크 받기·보내기 색. 막대 반쪽과 옆의 속도 글자를 같은 색으로 칠해 짝을 맞춘다
+NET_DOWN = f"{ESC}[38;2;86;176;235m"
+NET_UP = f"{ESC}[38;2;196;136;235m"
+NET_FLOOR = 1024  # 네트워크 막대 눈금의 바닥(바이트/초). 이보다 적으면 비어 보인다
 
 # 시작 화면 로고. 글자마다 따로 두고 한 칸씩 띄워 이어 붙인다
 LOGO = (
@@ -712,6 +716,17 @@ def human_bps(bits: int) -> str:
     return f"{bits / 10**6:.0f}Mbps"
 
 
+def log_frac(rate: float, link: float) -> float:
+    """네트워크 막대 길이. 회선 속도 대비를 로그 눈금으로 잰다.
+
+    그대로 나누면 1Gbps 회선에서 수십 KB/s 는 0.01% 라 평소엔 막대가 늘 비어 보인다.
+    로그로 재면 1KB/s 는 0, 1MB/s 는 절반쯤, 회선을 꽉 채우면 끝까지 찬다.
+    """
+    if rate <= 0 or link <= NET_FLOOR:
+        return 0.0
+    return min(1.0, math.log10(1 + rate / NET_FLOOR) / math.log10(1 + link / NET_FLOOR))
+
+
 def level_color(frac: float) -> str:
     if frac >= 0.85:
         return RED
@@ -912,8 +927,9 @@ class Monitor:
         self.interval_changed_at = 0.0  # 주기를 바꾼 직후 잠깐 강조하려고 기록
         self.latest_version = ""  # 새 버전 확인 결과. 별도 흐름에서 채운다
         # 프로세스 고르기와 종료 관련
-        # 같은 이름의 프로세스를 한 줄로 합쳐 보는가. 크롬처럼 여러 개 띄우는 프로그램의 몫이 보인다
-        self.grouped = False
+        # 같은 이름의 프로세스를 한 줄로 합쳐 보는가. 크롬처럼 여러 개 띄우는 프로그램의 몫이 보인다.
+        # 처음부터 묶어 둔다. 안 묶으면 표 위쪽이 같은 이름으로 도배돼 딴 프로그램이 밀려난다
+        self.grouped = True
         # 줄 번호가 아니라 PID 로 기억한다. 순위가 바뀌어도 따라가게. 묶음 보기에서는 이름이다
         self.selected = None
         self.scroll = 0
@@ -1014,21 +1030,25 @@ class Monitor:
         self.prev_t = now
 
     def sorted_rows(self):
-        """표에 그릴 줄. (키, CPU%, 메모리, 이름, 묶인 개수, 포트 목록).
+        """표에 그릴 줄. (키, CPU%, 메모리, 이름, 묶인 개수, 포트 목록, PID).
 
         키는 PID, 묶음 보기에서는 이름이다. 묶으면 CPU·메모리·포트를 합친다.
+        PID 는 묶인 게 하나뿐일 때 그 프로세스의 것이다.
         """
         if self.grouped:
             groups = {}
             for pid, pct, private, name in self.rows:
-                g = groups.setdefault(name, [name, 0.0, 0, name, 0, []])
+                g = groups.setdefault(name, [name, 0.0, 0, name, 0, [], pid])
                 g[1] += pct
                 g[2] += private
                 g[4] += 1
                 g[5].extend(self.ports.get(pid, []))
-            rows = [tuple(g[:5]) + (sorted(set(g[5])),) for g in groups.values()]
+            rows = [(*g[:5], sorted(set(g[5])), g[6]) for g in groups.values()]
         else:
-            rows = [(pid, pct, private, name, 1, self.ports.get(pid, [])) for pid, pct, private, name in self.rows]
+            rows = [
+                (pid, pct, private, name, 1, self.ports.get(pid, []), pid)
+                for pid, pct, private, name in self.rows
+            ]
         idx = 1 if self.sort_key == "cpu" else 2
         return sorted(rows, key=lambda r: r[idx], reverse=True)
 
@@ -1046,6 +1066,10 @@ class Monitor:
         self.scroll = 0
         if self.selected is not None:
             self.move_selection(0)  # 고른 줄이 화면 안에 들게 굴린다
+        if self.grouped:
+            self.set_status("같은 이름의 프로세스를 한 줄로 합쳐 보는 중 (×N = 합친 개수) — g 로 하나씩 보기", CYAN)
+        else:
+            self.set_status("프로세스를 하나씩 보는 중 — g 로 같은 이름끼리 합치기", CYAN)
 
     def set_status(self, text: str, color: str = GRAY):
         self.status = (text, color, time.monotonic())
@@ -1070,12 +1094,21 @@ class Monitor:
 
     def request_kill(self):
         """확인 단계로 넘긴다. 여기서 막을 건 미리 막는다."""
-        if self.grouped:
-            # 묶음째 끄면 같은 이름의 딴 프로그램까지 휩쓸 수 있다. 하나씩만 끈다
-            self.set_status("묶음 보기에서는 종료 불가 — g 로 풀고 하나씩 고르기", YELLOW)
+        if self.selected is None:
+            self.set_status("종료할 프로세스를 ↑↓ 로 먼저 선택", YELLOW)
             return
-        rows = self.sorted_rows()
-        target = next((r for r in rows if r[0] == self.selected), None)
+        if self.grouped:
+            # 하나뿐인 묶음은 그 프로세스를 끈다. 여럿 묶인 걸 통째로 끄면 같은 이름의
+            # 딴 프로그램까지 휩쓸 수 있어서 풀고 하나씩 고르게 한다
+            members = [r for r in self.rows if r[3] == self.selected]
+            if len(members) > 1:
+                self.set_status(
+                    f"{self.selected} {len(members)}개를 합친 줄 — g 로 하나씩 보기로 바꾼 뒤 고르기", YELLOW
+                )
+                return
+            target = members[0] if members else None
+        else:
+            target = next((r for r in self.rows if r[0] == self.selected), None)
         if target is None:
             self.set_status("종료할 프로세스를 ↑↓ 로 먼저 선택", YELLOW)
             return
@@ -1190,13 +1223,17 @@ class Monitor:
         right_w = max(9, *(dwidth(v[1]) for v in values.values()))
         head_w = 1 + label_w + bar_w + 2 + left_w + 3 + right_w
 
-        def summary(label, frac, key, extras, color="", reserve=0, sep=" / ", extra=0.0):
+        def summary(label, frac, key, extras, color="", reserve=0, sep=" / ", extra=0.0,
+                    bar=None, value_colors=("", "")):
             used_text, total_text = values[key]
             total_cell = f"{sep}{dpad(total_text, right_w)}" if total_text else " " * (3 + right_w)
             tail, used = fit_extras(head_w + reserve, extras, cols)
+            if bar is None:
+                bar = draw_bar(frac, bar_w, color, extra)
             line = (
-                f" {dpad(label, label_w)}{draw_bar(frac, bar_w, color, extra)}  "
-                f"{BOLD}{rpad(used_text, left_w)}{total_cell}{RESET}{tail}"
+                f" {dpad(label, label_w)}{bar}  "
+                f"{BOLD}{value_colors[0]}{rpad(used_text, left_w)}{RESET}"
+                f"{BOLD}{value_colors[1]}{total_cell}{RESET}{tail}"
             )
             return line, used - reserve
 
@@ -1234,25 +1271,10 @@ class Monitor:
         # 코어별 — 전체 CPU 가 낮은데 느리면 코어 하나가 꽉 찬 경우가 많다 (한 스레드로만 도는
         # 프로그램, 무한 루프). 평균에 묻히는 걸 한 칸씩 펼쳐 보인다. 막대와 같은 세로줄에서 시작한다
         if self.core_pct:
-            # 막대부터 값 칸 끝까지를 쓴다. 뒤의 설명이 다른 줄의 회색 정보와 같은 세로줄에 선다
-            area_w = head_w - 1 - label_w
-            strip = draw_cores(self.core_pct, area_w)
-            strip_w = dwidth(ANSI_RE.sub("", strip))
-            busiest = max(range(len(self.core_pct)), key=self.core_pct.__getitem__)
-            top = self.core_pct[busiest]
-            # (긴 설명, 짧은 설명). 좁으면 짧은 쪽을 쓴다. 긴 걸 자르면 정작 몇 번 코어인지가 잘린다
-            if top >= CORE_BUSY and self.total_cpu < 50:
-                notes = (f"코어 #{busiest} {top:.0f}% — 한 프로그램이 코어 하나를 꽉 씀", f"#{busiest} {top:.0f}% 꽉 참")
-                note_color = YELLOW
-            else:
-                notes = (f"가장 바쁜 코어 #{busiest} {top:.0f}%", f"최고 #{busiest} {top:.0f}%")
-                note_color = GRAY
-            room = cols - head_w - 2
-            note = notes[0] if dwidth(notes[0]) <= room else notes[1]
-            line = f" {dpad('코어', label_w)}{strip}{' ' * max(0, area_w - strip_w)}"
-            if room >= 6:
-                line += f"  {note_color}{dtrunc(note, room)}{RESET}"
-            out.append(line)
+            # 막대부터 값 칸 끝까지를 쓴다. 설명 글은 붙이지 않는다. 코어 하나가 잠깐씩 꽉 차는 건
+            # 흔해서, 글로 띄우면 수시로 깜빡이는 경고가 되고 정작 볼 건 칸 높이로 충분히 보인다
+            strip = draw_cores(self.core_pct, head_w - 1 - label_w)
+            out.append(f" {dpad('코어', label_w)}{strip}")
         else:
             out.append(f" {dpad('코어', label_w)}{DIM}측정 중{RESET}")
 
@@ -1296,10 +1318,12 @@ class Monitor:
         page_frac = page_used / page_total if page_total else 0.0
         out.append(summary("페이지", page_frac, "page", page_note, page_color)[0])
 
-        # 네트워크 — 막대는 회선(링크 속도) 대비 얼마나 쓰고 있나. 받기·보내기 중 큰 쪽으로 그린다.
+        # 네트워크 — 막대를 반으로 갈라 왼쪽은 받기(↓), 오른쪽은 보내기(↑). 한 막대에 둘 중
+        # 큰 쪽만 그리면 어느 방향인지 알 길이 없다. 옆의 속도 글자도 같은 색으로 칠해 짝을 맞춘다.
         # 프로세스별 사용량은 윈도우가 관리자 권한 없이는 알려주지 않아서 전체만 보인다
         net_frac = 0.0
         net_extras = []
+        rx_frac = tx_frac = 0.0
         if self.net_links:
             rx_link = sum(link[1] for link in self.net_links)
             tx_link = sum(link[2] for link in self.net_links)
@@ -1309,13 +1333,28 @@ class Monitor:
                     down * 8 / rx_link if rx_link else 0.0,
                     up * 8 / tx_link if tx_link else 0.0,
                 )
+                rx_frac = log_frac(down, rx_link / 8)
+                tx_frac = log_frac(up, tx_link / 8)
             if net_frac >= 0.85:
                 net_extras.append(("회선이 거의 가득 참 — 내려받기·화상회의가 느려질 수 있음", YELLOW, None))
             first = self.net_links[0]
             name = first[0] if len(self.net_links) == 1 else f"{first[0]} 외 {len(self.net_links) - 1}"
             net_extras.append((name, GRAY, 1))
             net_extras.append((f"회선 {human_bps(max(rx_link, tx_link))}", GRAY, 2))
-        out.append(summary("네트워크", net_frac, "net", net_extras, sep="   ")[0])
+        if USE_ASCII:
+            # 화살표가 v ^ 로 바뀌면 안 읽혀서 뺀다. 방향은 옆의 in·out 글자로 안다
+            half = (bar_w - 1) // 2
+            net_bar = f"{draw_bar(rx_frac, half, NET_DOWN)} {draw_bar(tx_frac, bar_w - 1 - half, NET_UP)}"
+        else:
+            half = (bar_w - 3) // 2
+            net_bar = (
+                f"{NET_DOWN}↓{draw_bar(rx_frac, half, NET_DOWN)} "
+                f"{NET_UP}↑{draw_bar(tx_frac, bar_w - 3 - half, NET_UP)}"
+            )
+        out.append(summary(
+            "네트워크", net_frac, "net", net_extras, sep="   ",
+            bar=net_bar, value_colors=(NET_DOWN, NET_UP),
+        )[0])
         out.append(f"{DIM}{'─' * cols}{RESET}")  # 기기 전체 상태와 프로세스 표를 가른다
 
         # 프로세스 표
@@ -1332,11 +1371,15 @@ class Monitor:
         else:
             mem_hdr = f"{BOLD}{mem_hdr}{RESET}{HEADER_BG}"
         port_hdr = f"{dpad('포트', port_w)}  " if port_w else ""
-        # 묶음 보기에서는 PID 자리에 몇 개를 합쳤는지 적는다
-        first_hdr = rpad("개수" if self.grouped else "PID", 7)
+        # 합쳐 보는 중이면 이름 칸 머리에 그 뜻을 적는다. ×27 만 보고는 무슨 숫자인지 모른다
+        name_hdr = dpad("이름", name_w)
+        if self.grouped:
+            hint = dtrunc("같은 이름끼리 합침 · ×N = 합친 개수", max(0, name_w - 6))
+            if name_w - 6 >= 10:
+                name_hdr = f"이름  {GRAY_ON_HEADER}{dpad(hint, name_w - 6)}"
         out.append(
-            f"{HEADER_BG} {first_hdr}  {cpu_hdr}  {mem_hdr}  "
-            f"{port_hdr}{dpad('이름', name_w)}{RESET}"
+            f"{HEADER_BG} {rpad('PID', 7)}  {cpu_hdr}  {mem_hdr}  "
+            f"{port_hdr}{name_hdr}{RESET}"
         )
 
         used_lines = len(out) + 2  # 표 아래 상태 줄과 도움말 줄 확보
@@ -1356,13 +1399,14 @@ class Monitor:
             shown = f"{self.scroll + 1}–{min(self.scroll + limit, len(rows))}"
             count_note = f" {shown}/{len(rows)}"
 
-        for idx, (key, pct, private, name, count, ports) in enumerate(window):
+        for idx, (key, pct, private, name, count, ports, pid) in enumerate(window):
             last_row = idx == len(window) - 1
             col_w = max(6, name_w - dwidth(count_note)) if last_row else name_w
             chosen = key == self.selected
             port_text = format_ports(ports) if port_w else ""
             name_cell = dpad(name, col_w)
-            first = f"×{count}" if self.grouped else str(key)
+            # 여럿 묶인 줄은 PID 자리에 몇 개를 합쳤는지 적는다. 하나뿐이면 그 PID 를 그대로 둔다
+            first = f"×{count}" if count > 1 else str(pid)
             if chosen:
                 # 고른 줄은 색을 다 빼고 흰 글씨 하나로. 파란 바탕 위 색 글자는 안 읽힌다
                 port_cell = f"{dpad(port_text, port_w)}  " if port_w else ""
@@ -1378,7 +1422,7 @@ class Monitor:
                     port_cell = f"{port_color}{dpad(port_text, port_w)}{RESET}  "
                 mem_color = proc_mem_color(private, mem["total"])
                 # 하나뿐인 묶음은 흐리게. 여러 개 합친 줄이 눈에 걸리게 한다
-                first_color = GRAY if self.grouped and count == 1 else ""
+                first_color = CYAN if count > 1 else ""  # 합친 줄이 눈에 걸리게
                 line = (
                     f" {first_color}{first:>7}{RESET}  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
                     f"{mem_color}{human_bytes(private):>8}{RESET}  "
@@ -1420,7 +1464,9 @@ class Monitor:
             ("k", "종료시키기", "종료", False, False),
             ("c", "CPU순", "CPU", False, self.sort_key == "cpu"),
             ("m", "메모리순", "메모리", False, self.sort_key == "mem"),
-            ("g", "이름별 묶기", "묶기", False, self.grouped),
+            # 지금 상태가 아니라 누르면 무엇이 되는지를 적는다
+            ("g", "하나씩 보기" if self.grouped else "같은 이름 합치기",
+             "펼치기" if self.grouped else "합치기", False, False),
             ("+/-", "갱신 간격", "간격", False, False),
             ("q", "나가기", "끝", True, False),
         ]
