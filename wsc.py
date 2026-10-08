@@ -29,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -90,11 +90,35 @@ SPARK_LEN = 20  # CPU 추이로 보여줄 최근 갱신 횟수
 # 인터럽트 처리 같은 게 몇 %p 는 남아서, 그보다 확실히 클 때만 보이게 한다
 UNLISTED_WARN = 10.0
 
+# 막대 한 칸의 색. (이 비율 밑까지, 256색 번호). 칸이 차오를수록 초록 → 노랑 → 빨강으로 번져서
+# 막대 끝 색만 봐도 얼마나 찼는지 안다. 노랑·빨강이 시작되는 자리는 level_color 의 기준과 맞춘다
+BAR_STOPS = (
+    (0.35, 40), (0.48, 76), (0.56, 112), (0.62, 148), (0.68, 184),
+    (0.76, 220), (0.83, 214), (0.90, 208), (1.01, 203),
+)
+
+# 시작 화면 로고. 글자마다 따로 두고 한 칸씩 띄워 이어 붙인다
+LOGO = (
+    ("██╗    ██╗", "██║    ██║", "██║ █╗ ██║", "██║███╗██║", "╚███╔███╔╝", " ╚══╝╚══╝ "),
+    ("███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"),
+    (" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"),
+)
+# 위 선 글자도 옛 콘솔에서는 두 칸으로 그려져 로고가 뭉개진다. 그때 쓰는 영문판
+LOGO_ASCII = (
+    (r"__        __", r"\ \      / /", r" \ \ /\ / / ", r"  \ V  V /  ", r"   \_/\_/   "),
+    (r" ____  ", r"/ ___| ", r"\___ \ ", r" ___) |", r"|____/ "),
+    (r"  ____ ", r" / ___|", r"| |    ", r"| |___ ", r" \____|"),
+)
+# 로고 글자색. 왼쪽에서 오른쪽으로 하늘색 → 파랑 → 보라. 그림자(선 글자)는 가라앉힌다
+LOGO_COLORS = tuple(f"{ESC}[38;5;{c}m" for c in (87, 81, 75, 69, 105, 141))
+LOGO_SHADOW = f"{ESC}[38;5;60m"
+SPLASH_SECONDS = 1.0  # 시작 로고를 띄워 두는 시간. 그사이 첫 측정을 끝내 첫 화면부터 값이 나온다
+
 # 옛 콘솔(conhost)을 한중일 코드 페이지로 쓰면 █ · … 같은 '폭이 애매한' 글자를
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
 ASCII_MAP = str.maketrans({
-    "█": "#", "·": ".", "…": "~", "–": "-", "—": "-",
-    "›": ">", "↑": "^", "↓": "v", "▼": "v",
+    "█": "#", "·": ".", "…": "~", "–": "-", "—": "-", "─": "-",
+    "›": ">", "↑": "^", "↓": "v", "▼": "v", "▕": "[", "▏": "]",
     "▁": "_", "▂": ".", "▃": ":", "▄": "-", "▅": "=", "▆": "+", "▇": "*",
 })
 USE_ASCII = False
@@ -664,18 +688,38 @@ def proc_cpu_color(pct: float) -> str:
     return GREEN
 
 
+def bar_color(frac: float) -> str:
+    """막대 칸이나 추이 칸 하나의 색. 그 칸이 나타내는 비율로 정한다."""
+    for upto, code in BAR_STOPS:
+        if frac < upto:
+            return f"{ESC}[38;5;{code}m"
+    return RED
+
+
 def draw_bar(frac: float, width: int, color: str = "") -> str:
+    """▕███▌····▏ 모양 막대. 양 끝 테두리까지 쳐서 width 칸이다.
+
+    색을 따로 주지 않으면 칸마다 제 자리의 색을 칠한다. 한 가지 색으로 칠하면
+    60% 와 84% 가 똑같은 노랑이라 얼마나 찼는지 막대 길이로만 갈라야 한다.
+    """
     frac = max(0.0, min(1.0, frac))
-    color = color or level_color(frac)
-    filled = frac * width
+    inner = max(1, width - 2)
+    filled = frac * inner
     full = int(filled)
-    body = "█" * full
-    if full < width and not USE_ASCII:
+    cells = ["█"] * full
+    if full < inner and not USE_ASCII:
         eighths = int((filled - full) * 8)
         if eighths > 0:
-            body += BLOCKS[eighths - 1]
-    empty = width - len(body)
-    return f"{color}{body}{RESET}{DIM}{'·' * empty}{RESET}"
+            cells.append(BLOCKS[eighths - 1])
+    out, last = [f"{GRAY}▕"], ""
+    for i, ch in enumerate(cells):
+        cell_color = color or bar_color((i + 0.5) / inner)
+        if cell_color != last:  # 색이 바뀌는 칸에서만 색 코드를 넣는다
+            out.append(cell_color)
+            last = cell_color
+        out.append(ch)
+    out.append(f"{RESET}{DIM}{'·' * (inner - len(cells))}{RESET}{GRAY}▏{RESET}")
+    return "".join(out)
 
 
 def draw_spark(values, width: int) -> str:
@@ -686,8 +730,30 @@ def draw_spark(values, width: int) -> str:
     out = []
     for v in list(values)[-width:]:
         level = min(len(SPARKS) - 1, int(v / 100.0 * len(SPARKS)))
-        out.append(f"{level_color(v / 100.0)}{SPARKS[level]}")
+        out.append(f"{bar_color(v / 100.0)}{SPARKS[level]}")
     return "".join(out) + RESET
+
+
+def logo_lines() -> tuple:
+    """색을 입힌 로고 줄 목록과 그 폭. 영문 기호 모드면 영문판을 쓴다."""
+    glyphs = LOGO_ASCII if USE_ASCII else LOGO
+    rows = [" ".join(letter[i] for letter in glyphs) for i in range(len(glyphs[0]))]
+    width = max(len(row) for row in rows)
+    out = []
+    for row in rows:
+        parts, last = [], ""
+        for col, ch in enumerate(row):
+            if ch != " ":
+                if ch == "█" or USE_ASCII:
+                    color = LOGO_COLORS[col * len(LOGO_COLORS) // width]
+                else:
+                    color = LOGO_SHADOW
+                if color != last:
+                    parts.append(color)
+                    last = color
+            parts.append(ch)
+        out.append("".join(parts) + RESET)
+    return out, width
 
 
 def proc_mem_color(private: int, total: int) -> str:
@@ -1083,7 +1149,7 @@ class Monitor:
             net_extras.append((name, GRAY, 1))
             net_extras.append((f"회선 {human_bps(max(rx_link, tx_link))}", GRAY, 2))
         out.append(summary("네트워크", net_frac, "net", net_extras, sep="   ")[0])
-        out.append("")
+        out.append(f"{DIM}{'─' * cols}{RESET}")  # 기기 전체 상태와 프로세스 표를 가른다
 
         # 프로세스 표
         # 포트 칸은 자리가 있을 때만 낸다. 좁은 창에서는 이름이 먼저다
@@ -1398,7 +1464,59 @@ def draw(lines_out, cols: int, rows: int):
     sys.stdout.flush()
 
 
-def run_interactive(monitor: Monitor) -> int:
+def render_splash(monitor: Monitor, cols: int, rows: int, progress: float) -> list:
+    """시작 화면. 로고 아래에 기기 이름과 첫 측정이 얼마나 됐는지를 띄운다."""
+    logo, logo_w = logo_lines()
+    left = " " * max(1, (cols - logo_w) // 2)
+    specs = f"{CPU_BRAND} · {NCPU}코어 · 메모리 {human_bytes(monitor.mem['total'])}"
+    body = [
+        "",
+        f"{GRAY}windows system check  {RESET}{CYAN}{BOLD}{VERSION}{RESET}",
+        f"{GRAY}{dtrunc(specs, max(10, cols - len(left) - 1))}{RESET}",
+        "",
+        f"{draw_bar(progress, logo_w, CYAN)}  {GRAY}첫 측정 중…{RESET}",
+    ]
+    # 창이 로고보다 좁거나 낮으면 로고는 빼고 글자만 띄운다
+    if cols >= logo_w + 4 and rows >= len(logo) + len(body) + 2:
+        block = logo + body
+    else:
+        block = body[1:]
+    top = max(0, (rows - len(block)) // 2)
+    return [""] * top + [left + line if line else "" for line in block]
+
+
+def show_splash(monitor: Monitor):
+    """시작 로고를 SPLASH_SECONDS 동안 띄운다. 아무 키나 누르면 바로 넘어간다.
+
+    누른 키는 읽지 않고 남겨 둔다. 로고가 뜬 사이 q 를 눌렀으면 그대로 나가게 하려는 것.
+    """
+    start = time.monotonic()
+    while True:
+        progress = min(1.0, (time.monotonic() - start) / SPLASH_SECONDS)
+        size = term_size()
+        draw(render_splash(monitor, size.columns, size.lines, progress), size.columns, size.lines)
+        if progress >= 1.0 or key_waiting(0.04):
+            return
+
+
+def print_version() -> int:
+    """--version. 터미널이면 로고와 함께, 파일·파이프면 한 줄로 찍는다 (스크립트가 읽기 쉽게)."""
+    plain = f"wsc {VERSION}  {REPO_URL}"
+    saved_mode = enable_vt() if sys.stdout.isatty() else None
+    if saved_mode is None:
+        print(plain)
+        return 0
+    logo, _ = logo_lines()
+    print()
+    for line in logo:
+        print(f"  {line}")
+    print(f"\n  {GRAY}windows system check  {RESET}{CYAN}{BOLD}{VERSION}{RESET}")
+    print(f"  {GRAY}{REPO_URL}{RESET}\n")
+    restore_console_mode(saved_mode)
+    return 0
+
+
+def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
     saved_mode = enable_vt()
     if saved_mode is None:
         print(
@@ -1419,6 +1537,10 @@ def run_interactive(monitor: Monitor) -> int:
 
     try:
         monitor.tick()  # 차분 계산의 기준점
+        if show_logo:
+            # 로고를 띄운 사이 흐른 시간으로 첫 값을 낸다. 첫 화면이 '측정 중' 으로 비지 않는다
+            show_splash(monitor)
+            monitor.tick()
         size = term_size()
         draw(monitor.render(size.columns, size.lines), size.columns, size.lines)
 
@@ -1653,14 +1775,17 @@ def main():
     parser.add_argument(
         "--check-update", action="store_true", help="새 버전이 있는지 확인만 한다 (설치하지 않음)"
     )
-    parser.add_argument(
-        "-v", "--version", action="version", version=f"wsc {VERSION}  {REPO_URL}"
-    )
+    parser.add_argument("-v", "--version", action="store_true", help="설치된 버전 보기")
     parser.add_argument(
         "--no-check", action="store_true", help="실행할 때 새 버전 확인을 건너뛴다"
     )
+    parser.add_argument("--no-logo", action="store_true", help="시작 로고를 건너뛴다")
     args = parser.parse_args()
 
+    if args.version:
+        if sys.stdout.isatty():
+            USE_ASCII = args.ascii or (not args.unicode and wants_ascii())
+        return print_version()
     if args.update or args.check_update:
         return self_update(check_only=args.check_update)
 
@@ -1670,7 +1795,7 @@ def main():
         monitor.start_version_check()
     if sys.stdout.isatty() and sys.stdin.isatty():
         USE_ASCII = args.ascii or (not args.unicode and wants_ascii())
-        return run_interactive(monitor)
+        return run_interactive(monitor, show_logo=not args.no_logo)
     USE_ASCII = not args.unicode  # 파일·파이프는 코드 페이지에 없는 막대 글자가 ? 로 깨진다
     return run_once(monitor)
 
