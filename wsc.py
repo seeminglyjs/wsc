@@ -31,7 +31,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -123,6 +123,17 @@ VANISH_SECONDS = 0.75
 VANISH_GLYPHS = "▓▒░·"
 VANISH_GLYPHS_ASCII = "#=-."
 KILL_REFRESH_DELAY = 0.15  # 종료시킨 뒤 목록을 다시 읽기까지 기다리는 초
+
+# 프로세스 표의 '해독' 연출. 갱신으로 바뀐 글자만 무작위 글자로 깜빡이다가 왼쪽부터 제 글자로 굳는다
+LIST_DECODE_SECONDS = 0.4
+LIST_NOISE = "0123456789abcdef#%&*+=?"
+LIST_NOISE_RGB = (64, 150, 170)
+LIST_SETTLE_RGB = (235, 250, 255)  # 막 굳은 글자가 잠깐 띠는 색
+LIST_SETTLE = 0.1  # 굳은 뒤 그 색으로 남는 동안 (진행 비율)
+
+# 표가 잠겼을 때 두르는 테두리. 잠기는 순간 하얗게 번쩍였다가 이 색으로 가라앉는다
+LOCK_RGB = (245, 180, 60)
+LOCK_SETTLE_SECONDS = 0.35
 
 # 상세 창. 뒤 화면을 이 비율까지 어둡게 하고, 여는 동안 창이 가운데에서 좌우로 펼쳐진다
 DETAIL_DIM = 0.32
@@ -1239,6 +1250,45 @@ def vanish_line(text: str, age: float) -> str:
     return "".join(out)
 
 
+def decode_spots(old: str, new: str, width: int) -> list:
+    """표 한 줄이 바뀔 때 해독 연출을 할 칸들. [(칸 위치, 두 칸 글자인가, 굳는 때)].
+
+    글자가 같은 칸은 건드리지 않는다. 숫자 몇 자리만 바뀌면 그 자리만 깜빡인다.
+    굳는 때는 왼쪽일수록 이르고 칸마다 조금씩 어긋난다 (0~1, 연출 진행 비율).
+    """
+    before, after = to_cells(old, width), to_cells(new, width)
+    last = max((i for i, c in enumerate(after) if c[0] not in (" ", "")), default=0) or 1
+    spots = []
+    for c in range(1, width):  # 맨 앞 칸은 고른 줄 표시(›) 자리라 뺀다
+        ch = after[c][0]
+        if ch == "" or (ch == before[c][0] and (c + 1 >= width or after[c + 1][0] == before[c + 1][0])):
+            continue
+        if ch == " " and before[c][0] in (" ", ""):
+            continue
+        wide = c + 1 < width and after[c + 1][0] == ""
+        at = 0.65 * min(1.0, c / last) + 0.35 * LOGO_JITTER[(c * 53) % len(LOGO_JITTER)]
+        spots.append((c, wide, at * (1 - LIST_SETTLE)))
+    return spots
+
+
+def decode_line(line: str, spots: list, progress: float, width: int) -> str:
+    """해독 중인 표 한 줄. 아직 안 굳은 칸은 무작위 글자로, 막 굳은 칸은 밝게 그린다."""
+    cells = to_cells(line, width)
+    noise_style = (LIST_NOISE_RGB, None, False)
+    for c, wide, at in spots:
+        if progress < at:
+            glyph = random.choice(LIST_NOISE)
+            cells[c] = [glyph, noise_style]
+            if wide:
+                cells[c + 1] = [random.choice(LIST_NOISE), noise_style]
+        elif progress < at + LIST_SETTLE and cells[c][0] != " ":
+            _, bg, bold = cells[c][1]
+            cells[c][1] = (LIST_SETTLE_RGB, bg, bold)
+            if wide:
+                cells[c + 1][1] = (LIST_SETTLE_RGB, bg, bold)
+    return from_cells(cells)
+
+
 def human_age(seconds: float) -> str:
     """얼마나 오래됐는지. 상세 창의 시작 시각 옆에 붙인다."""
     minutes = int(seconds // 60)
@@ -1398,6 +1448,10 @@ class Monitor:
         self.kill_watch = None  # 종료시킨 프로세스가 사라지는지 지켜본다. (PID, 생성 시각, 줄 키, 그만 볼 시각)
         self.vanish = None  # 사라지는 줄. (표 안 순서, 굴림 위치, 글자만 남긴 줄, 시작 시각)
         self._path_cache = (None, "")  # ((PID, 생성 시각), 실행 파일 경로)
+        self.frozen = None  # 잠긴 동안의 줄 순서. {줄 키: 순번}
+        self.locked_at = 0.0  # 잠근 시각. 테두리가 잠기는 연출에 쓴다
+        self.row_text = {}  # {표 안 순서: 글자만 남긴 줄} 지난번에 그린 것. 바뀐 글자를 찾는다
+        self.decoding = {}  # {표 안 순서: (바꿀 칸 목록, 시작 시각)} 해독되며 바뀌는 줄
 
     def start_version_check(self):
         """새 버전 확인을 뒷전으로 돌린다. 화면이 뜨는 걸 막지 않게 하려는 것."""
@@ -1550,10 +1604,28 @@ class Monitor:
                 for pid, pct, private, name in self.rows
             ]
         idx = 1 if self.sort_key == "cpu" else 2
-        return sorted(rows, key=lambda r: r[idx], reverse=True)
+        rows.sort(key=lambda r: r[idx], reverse=True)
+        # 줄을 고르는 동안은 표가 잠긴다. 순서를 잠근 순간 그대로 두고 숫자만 새로 채운다.
+        # 고르는 사이 순위가 바뀌어 줄이 위아래로 튀면 엉뚱한 걸 고르게 된다.
+        # 잠근 뒤 새로 뜬 프로세스는 맨 아래에 붙고, 끝난 것은 빠진다
+        if self.selected is None:
+            self.frozen = None
+            return rows
+        if self.frozen is None:
+            self.frozen = {r[0]: i for i, r in enumerate(rows)}
+            self.locked_at = time.monotonic()
+            return rows
+        known = [r for r in rows if r[0] in self.frozen]
+        known.sort(key=lambda r: self.frozen[r[0]])
+        return known + [r for r in rows if r[0] not in self.frozen]
+
+    @property
+    def locked(self) -> bool:
+        return self.selected is not None
 
     def toggle_group(self):
         """묶음 보기를 켜고 끈다. 고른 줄은 같은 프로세스(또는 그 묶음)로 옮겨 준다."""
+        self.frozen = None  # 줄 키가 PID 와 이름 사이로 바뀌니 잠근 순서를 새로 잡는다
         if self.grouped:
             # 묶음에서 풀면 그 이름 중 지금 정렬 기준으로 가장 큰 것을 고른다
             name = self.selected
@@ -1688,6 +1760,8 @@ class Monitor:
             or self.vanish
             or (self.detail_at is not None and now - self.detail_at < DETAIL_OPEN_SECONDS)
             or any(now - t < FLASH_SECONDS for t in self.flashes.values())
+            or self.decoding
+            or (self.locked and now - self.locked_at < LOCK_SETTLE_SECONDS)
         ):
             return FRAME_SECONDS
         # 그래프는 늘 조금씩 흐른다. 상세 창 뒤에 깔려 어두울 때는 멈춰 둔다
@@ -2105,13 +2179,17 @@ class Monitor:
             # 이름표는 달지 않는다. CPU 줄 바로 아래 같은 세로줄에 서 있어 무슨 그래프인지는 자리로 안다
             for row in draw_graph(points, graph_w, graph_h):
                 out.append(f" {' ' * label_w}{row}")
-        out.append(f"{DIM}{'─' * cols}{RESET}")  # 기기 전체 상태와 프로세스 표를 가른다
+        # 기기 전체 상태와 프로세스 표를 가르는 줄. 표가 잠기면 잠금 테두리의 윗변이 된다. 표를 다 그린 뒤 채운다
+        sep_at = len(out)
+        out.append("")
 
         # 프로세스 표
         # 포트 칸은 자리가 있을 때만 낸다. 좁은 창에서는 이름이 먼저다
         port_w = 9 if cols >= 76 else 0
-        # 이름 칸이 창 끝까지 간다. 제목 줄·조작 줄과 오른쪽 끝이 맞아야 표가 반듯해 보인다
-        name_w = max(14, cols - 29 - (port_w + 2 if port_w else 0))
+        # 이름 칸이 창 끝까지 간다. 제목 줄·조작 줄과 오른쪽 끝이 맞아야 표가 반듯해 보인다.
+        # 양 끝 한 칸씩은 잠금 테두리 자리로 늘 비워 둔다. 잠글 때마다 표가 들썩이지 않게
+        table_w = cols - 2
+        name_w = max(14, table_w - 29 - (port_w + 2 if port_w else 0))
         # 색 코드는 폭 계산 뒤에 감싼다. 안 그러면 이스케이프 문자까지 폭으로 세서 표가 어긋난다
         # 정렬 기준 칸에는 ▼ 를 붙인다. 굵은 글씨만으로는 어느 쪽인지 잘 안 보인다
         cpu_hdr = rpad("CPU%▼" if self.sort_key == "cpu" else "CPU%", 7)
@@ -2161,6 +2239,12 @@ class Monitor:
             shown = f"{self.scroll + 1}–{min(self.scroll + limit, len(rows))}"
             count_note = f" {shown}/{len(rows)}"
 
+        # 갱신으로 바뀐 글자는 무작위 글자로 깜빡이다 굳게 그린다 (해독 연출). 잠긴 동안은 멈춘다.
+        # 글자가 바뀐 칸만 건드려서, 숫자 몇 자리만 바뀐 줄은 그 자리만 깜빡인다
+        decode_on = self.tween.enabled and not self.locked
+        if not decode_on:
+            self.decoding.clear()
+        row_text = {}
         table = {}
         for idx, entry in enumerate(entries):
             last_row = idx == len(entries) - 1
@@ -2202,17 +2286,72 @@ class Monitor:
                     f"{mem_color}{human_bytes(private):>8}{RESET}  "
                     f"{port_cell}{dim_ext(name_cell)}"
                 )
-            out.append(line + note)
+            line += note
+            plain = f" {body}"
+            row_text[idx] = plain
+            before = self.row_text.get(idx, "")
+            if decode_on and before[1:] != plain[1:]:
+                self.decoding[idx] = (decode_spots(before, plain, table_w), now)
+            spell = self.decoding.get(idx)
+            if spell:
+                progress = (now - spell[1]) / LIST_DECODE_SECONDS
+                if progress >= 1.0:
+                    del self.decoding[idx]
+                else:
+                    line = decode_line(line, spell[0], progress, table_w)
+            out.append(line)
         self.last_table = table
+        self.row_text = row_text
+        for idx in [i for i in self.decoding if i not in row_text]:
+            del self.decoding[idx]
 
-        # 알림 줄. 없으면 빈 줄로 남겨 아래 도움말 위치가 흔들리지 않게 한다
+        # 잠금 테두리. 표 머리부터 마지막 줄까지 양옆에 세로줄을 두르고, 가르는 줄을 윗변으로 쓴다.
+        # 잠기는 순간 하얗게 번쩍였다가 호박색으로 가라앉는다. 안 잠겼으면 양옆은 빈칸이다
+        if self.locked:
+            settle = ease_out((now - self.locked_at) / LOCK_SETTLE_SECONDS)
+            lock_rgb = tuple(round(255 + (c - 255) * settle) for c in LOCK_RGB)
+            frame = rgb(lock_rgb)
+            if USE_ASCII:
+                corner_l, corner_r, side, edge, title = "+", "+", "|", "-", " LOCK "
+            else:
+                corner_l, corner_r, side, edge, title = "╭", "╮", "│", "─", " 🔒 잠김 "
+            hint = " 순서 고정 · Esc 로 풀기 "
+            if dwidth(title) + dwidth(hint) + 4 > cols:
+                hint = ""
+            rest = max(0, cols - 3 - dwidth(title) - dwidth(hint))
+            out[sep_at] = (
+                f"{frame}{corner_l}{edge}{BOLD}{title}{RESET}{GRAY}{hint}{RESET}"
+                f"{frame}{edge * rest}{corner_r}{RESET}"
+            )
+            left_side = right_side = f"{frame}{side}{RESET}"
+        else:
+            out[sep_at] = f"{DIM}{'─' * cols}{RESET}"
+            left_side = right_side = " "
+        for i in range(sep_at + 1, len(out)):
+            out[i] = f"{left_side}{out[i]}{right_side}"
+
+        # 알림 줄. 없으면 빈 줄로 남겨 아래 도움말 위치가 흔들리지 않게 한다.
+        # 표가 잠겨 있으면 잠금 테두리의 아랫변이 되고, 알릴 말은 그 선 안에 박는다
         text, color, shown_at = self.status
         if text and time.monotonic() - shown_at < 5.0:
-            out.append(f"{color} {dtrunc(text, cols - 2)}{RESET}")
+            message = (text, color)
         elif self.update_ready:
             # 알릴 말이 없을 때만. 조작 줄에 끼워 넣으면 '누를 것'과 섞여 헷갈린다
-            note = f"새 버전 {self.latest_version} 나옴 — q 로 나간 뒤 wsc --update"
-            out.append(f"{CYAN}{BOLD} {dtrunc(note, cols - 2)}{RESET}")
+            message = (f"새 버전 {self.latest_version} 나옴 — q 로 나간 뒤 wsc --update", f"{CYAN}{BOLD}")
+        else:
+            message = None
+        if self.locked:
+            corner_l, corner_r, edge = ("+", "+", "-") if USE_ASCII else ("╰", "╯", "─")
+            inner = ""
+            if message:
+                inner = f" {dtrunc(message[0], cols - 6)} "
+            rest = max(0, cols - 3 - dwidth(inner))
+            out.append(
+                f"{frame}{corner_l}{edge}{RESET}{message[1] if message else ''}{inner}{RESET}"
+                f"{frame}{edge * rest}{corner_r}{RESET}"
+            )
+        elif message:
+            out.append(f"{message[1]} {dtrunc(message[0], cols - 2)}{RESET}")
         else:
             out.append("")
 
@@ -2343,8 +2482,10 @@ class Monitor:
             self.toggle_group()
         elif key in ("c", "C"):
             self.sort_key = "cpu"
+            self.frozen = None  # 정렬을 바꾸라는 건 순서를 새로 잡으라는 뜻이다. 잠겨 있어도 다시 줄 세운다
         elif key in ("m", "M"):
             self.sort_key = "mem"
+            self.frozen = None
         elif key in ("+", "="):
             self.interval = min(INTERVAL_MAX, round(self.interval + 0.5, 1))
             self.interval_changed_at = time.monotonic()
