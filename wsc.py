@@ -30,7 +30,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -102,6 +102,9 @@ BRAILLE_BASE = 0x2800
 GRAPH_BASELINE = "⣀"  # 값이 0 인 자리에 까는 바닥 선
 # 그래프 높이(줄 수)를 창 높이로 정한다. (이 줄 수 이상이면, 이만큼). 낮으면 안 그리고 CPU 줄 끝 추이로 대신한다
 GRAPH_HEIGHTS = ((34, 3), (27, 2))
+# 측정값 하나가 차지하는 점 열 수. 1 이면 뾰족한 값이 열 사이를 지날 때 높이가 반으로 꺼졌다 살아나며 들썩인다
+GRAPH_DOTS_PER_SAMPLE = 2
+GRAPH_FRAME_SECONDS = 1 / 15  # 그래프가 흘러가게 화면을 다시 그리는 간격. 점 열 하나 미는 데 갱신 주기 절반이 걸려 이 정도면 매끄럽다
 
 # 측정값이 바뀌면 막대와 숫자를 툭 바꾸지 않고 이만큼(초)에 걸쳐 미끄러지게 옮긴다
 TWEEN_SECONDS = 0.45
@@ -865,17 +868,42 @@ def draw_spark(values, width: int) -> str:
     return "".join(out) + RESET
 
 
-def draw_graph(values, width: int, height: int) -> list:
-    """최근 CPU% 를 점자 글자 면적 그래프로. height 줄, width 칸이고 한 칸에 기록 둘이 들어간다.
+def graph_points(values: list, stamps: list, now: float, count: int) -> list:
+    """그래프의 점 열 count 개에 그릴 값. 왼쪽부터 차례로, 기록이 닿지 않는 열은 None.
 
-    눈금은 추이처럼 0~100% 고정이다. 새 값이 오른쪽 끝에 붙고 옛 값은 왼쪽으로 밀려난다.
+    측정값 하나가 점 열 GRAPH_DOTS_PER_SAMPLE 개를 차지하고, 그 사이는 앞뒤 값을 이어 채운다.
+    오른쪽 끝은 직전 값에서 최신 값으로, 측정 간격에 걸쳐 시각에 맞춰 다가간다.
+    그래서 다음 값이 올 때쯤 그래프가 딱 한 측정만큼 밀려 있어, 새 값이 와도 끊기지 않고 이어진다.
+    """
+    last = len(values) - 1
+    if last < 1:
+        return [None] * count
+    gap = stamps[-1] - stamps[-2]
+    progress = min(1.0, max(0.0, (now - stamps[-1]) / gap)) if gap > 0 else 1.0
+    head = last - 1 + progress  # 오른쪽 끝 열이 가리키는 기록 위치 (소수)
+    out = []
+    for x in range(count):
+        q = head - x / GRAPH_DOTS_PER_SAMPLE
+        if q < 0:
+            out.extend([None] * (count - x))
+            break
+        i = int(q)
+        t = q - i
+        out.append(values[i] if i >= last else values[i] + (values[i + 1] - values[i]) * t)
+    out.reverse()
+    return out
+
+
+def draw_graph(points: list, width: int, height: int) -> list:
+    """CPU% 를 점자 글자 면적 그래프로. height 줄, width 칸이고 한 칸에 점 열이 둘 들어간다.
+
+    points 는 점 열마다의 값이다 (graph_points). 눈금은 추이처럼 0~100% 고정이다.
     색은 높이로 칠한다. 아래는 초록, 위로 갈수록 노랑·빨강이라 꼭대기 색만 봐도 얼마나 튀었는지 안다.
     """
     dots = height * 4
-    values = list(values)[-width * 2:]
-    # 기록이 모자라면 왼쪽을 비워 둔다. 오른쪽 끝이 늘 '지금'이다
-    levels = [None] * (width * 2 - len(values)) + [
-        max(1, round(v / 100.0 * dots)) if v > 0.5 else 0 for v in values
+    levels = [
+        None if v is None else max(1, round(v / 100.0 * dots)) if v > 0.5 else 0
+        for v in points
     ]
     rows = []
     for row in range(height):
@@ -1016,11 +1044,12 @@ class Monitor:
         self.total_cpu = 0.0
         self.unlisted_cpu = 0.0  # 전체 CPU 중 목록의 어느 프로세스에도 안 잡힌 몫
         self.cpu_hist = collections.deque(maxlen=CPU_HIST_MAX)  # 최근 전체 CPU%. 추이 그래프용
-        self.cpu_hist_at = collections.deque(maxlen=CPU_HIST_MAX)  # 위 값을 잰 시각. 그래프가 몇 분치인지 적는다
+        self.cpu_hist_at = collections.deque(maxlen=CPU_HIST_MAX)  # 위 값을 잰 시각. 그래프를 시각에 맞춰 흘려 그린다
         # 화면에 그리는 값. 측정값을 따라 미끄러진다. 대화형 화면에서만 켠다
         self.tween = Tween()
         # 대화형 화면인가. 점자 그래프처럼 파일로 내보내면 깨지는 것은 이때만 그린다
         self.live = False
+        self.graph_h = 0  # 지난번에 그린 추이 그래프 높이. 0 이면 그래프가 없어 계속 다시 그릴 필요가 없다
         self.prev_cores = []  # 지난번 코어별 (유휴, 전체) 누적 시간
         self.core_pct = []  # 코어별 사용률(%). 두 번 재기 전엔 빈 목록
         self.ready = False
@@ -1519,22 +1548,18 @@ class Monitor:
         )[0])
 
         # CPU 추이 그래프. 막대와 같은 세로줄에서 시작해 창 오른쪽 끝까지 쓴다.
-        # 맨 오른쪽 값은 미끄러지는 CPU 값이라, 새 값이 올 때 그래프 끝이 스르르 솟거나 내려앉는다
+        # 갱신 때마다 한 칸씩 툭 밀면 모든 칸의 점 모양이 한꺼번에 바뀌어 덜컥거린다.
+        # 그래서 시각에 맞춰 그린다. 측정값 사이를 이어 그리고, 그사이 흐른 시간만큼 조금씩 민다
+        self.graph_h = graph_h
         if graph_h:
             graph_w = cols - 1 - label_w
-            hist = list(self.cpu_hist)[-graph_w * 2:]
-            if hist:
-                hist[-1] = cpu_now
-            # 첫 줄엔 이름을, 끝 줄엔 그래프가 몇 초(분)치인지를 적는다
-            labels = [""] * graph_h
-            labels[0] = dpad("CPU 추이", label_w)
-            shown_at = list(self.cpu_hist_at)[-len(hist):]
-            if len(shown_at) >= 2:
-                span = shown_at[-1] - shown_at[0]
-                span_text = f"{span / 60:.0f}분" if span >= 90 else f"{span:.0f}초"
-                labels[-1] = f"{GRAY}{dpad(span_text, label_w)}{RESET}"
-            for label, row in zip(labels, draw_graph(hist, graph_w, graph_h)):
-                out.append(f" {label or ' ' * label_w}{row}")
+            keep = graph_w * 2 // GRAPH_DOTS_PER_SAMPLE + 2
+            points = graph_points(
+                list(self.cpu_hist)[-keep:], list(self.cpu_hist_at)[-keep:], now, graph_w * 2
+            )
+            # 이름표는 달지 않는다. CPU 줄 바로 아래 같은 세로줄에 서 있어 무슨 그래프인지는 자리로 안다
+            for row in draw_graph(points, graph_w, graph_h):
+                out.append(f" {' ' * label_w}{row}")
         out.append(f"{DIM}{'─' * cols}{RESET}")  # 기기 전체 상태와 프로세스 표를 가른다
 
         # 프로세스 표
@@ -1980,8 +2005,11 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
             # 갱신 분기에만 걸려서 키가 영영 안 읽히기 때문이다.
             # 막대가 미끄러지는 중이면 다음 장 그릴 때까지만 기다린다
             remaining = max(0.0, deadline - time.monotonic())
+            # 그래프가 떠 있으면 늘 조금씩 흘러가게 그린다
             if monitor.tween.busy(time.monotonic()):
                 remaining = min(remaining, FRAME_SECONDS)
+            elif monitor.graph_h:
+                remaining = min(remaining, GRAPH_FRAME_SECONDS)
             if key_waiting(remaining):
                 quit_now = False
                 while msvcrt.kbhit():  # 밀린 키는 한 번에 다 처리한다
