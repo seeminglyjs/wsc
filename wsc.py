@@ -29,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -83,19 +83,29 @@ PROTECTED_NAMES = {
 }
 PROTECTED_PIDS = {0, 4}  # 0 은 유휴 프로세스, 4 는 커널(System)
 
-BLOCKS = "▏▎▍▌▋▊▉█"
 SPARKS = "▁▂▃▄▅▆▇█"
 SPARK_LEN = 20  # CPU 추이로 보여줄 최근 갱신 횟수
 # 전체 CPU 에서 프로세스 몫을 뺀 나머지가 이만큼(%p) 넘으면 CPU 줄에 띄운다. 평소에도
 # 인터럽트 처리 같은 게 몇 %p 는 남아서, 그보다 확실히 클 때만 보이게 한다
 UNLISTED_WARN = 10.0
 
-# 막대 한 칸의 색. (이 비율 밑까지, 256색 번호). 칸이 차오를수록 초록 → 노랑 → 빨강으로 번져서
-# 막대 끝 색만 봐도 얼마나 찼는지 안다. 노랑·빨강이 시작되는 자리는 level_color 의 기준과 맞춘다
+# 막대 색이 바뀌는 자리. (비율, RGB). 사이는 섞어서 칠한다. 칸이 차오를수록 짙은 청록 → 초록 →
+# 노랑 → 빨강으로 번져서 막대 끝 색만 봐도 얼마나 찼는지 안다. 노랑·빨강이 짙어지는 자리는
+# level_color 의 기준(60%, 85%)과 맞춘다. 256색은 초록 칸이 몇 개 없어 짧은 막대가 단색이 된다
 BAR_STOPS = (
-    (0.35, 40), (0.48, 76), (0.56, 112), (0.62, 148), (0.68, 184),
-    (0.76, 220), (0.83, 214), (0.90, 208), (1.01, 203),
+    (0.00, (13, 110, 86)),
+    (0.30, (34, 197, 94)),
+    (0.52, (163, 230, 53)),
+    (0.66, (250, 204, 21)),
+    (0.85, (249, 115, 22)),
+    (1.00, (239, 68, 68)),
 )
+BAR_FILL = "━"  # 줄 높이를 다 채우는 █ 는 위아래 막대가 맞붙어 한 덩어리로 보인다
+BAR_HALF = "╸"  # 반 칸
+# 빈 칸은 가는 선. 색이 없어도(파이프·파일) 굵은 선과 모양으로 갈린다
+BAR_TRACK = "─"
+BAR_TRACK_COLOR = f"{ESC}[38;5;239m"
+BAR_DIM_START = 0.55  # 막대 첫 칸의 밝기. 끝으로 갈수록 밝아져서 짧은 막대도 그라데이션이 보인다
 
 # 시작 화면 로고. 글자마다 따로 두고 한 칸씩 띄워 이어 붙인다
 LOGO = (
@@ -118,7 +128,7 @@ SPLASH_SECONDS = 1.0  # 시작 로고를 띄워 두는 시간. 그사이 첫 측
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
 ASCII_MAP = str.maketrans({
     "█": "#", "·": ".", "…": "~", "–": "-", "—": "-", "─": "-",
-    "›": ">", "↑": "^", "↓": "v", "▼": "v", "▕": "[", "▏": "]",
+    "›": ">", "↑": "^", "↓": "v", "▼": "v",
     "▁": "_", "▂": ".", "▃": ":", "▄": "-", "▅": "=", "▆": "+", "▇": "*",
 })
 USE_ASCII = False
@@ -691,37 +701,56 @@ def proc_cpu_color(pct: float) -> str:
     return GREEN
 
 
+def bar_rgb(frac: float) -> tuple:
+    """비율 하나에 맞는 막대 색. BAR_STOPS 사이를 섞는다."""
+    frac = max(0.0, min(1.0, frac))
+    for (lo, lo_rgb), (hi, hi_rgb) in zip(BAR_STOPS, BAR_STOPS[1:]):
+        if frac <= hi:
+            t = (frac - lo) / (hi - lo)
+            return tuple(round(a + (b - a) * t) for a, b in zip(lo_rgb, hi_rgb))
+    return BAR_STOPS[-1][1]
+
+
+def rgb(color: tuple, bright: float = 1.0) -> str:
+    return f"{ESC}[38;2;{';'.join(str(round(c * bright)) for c in color)}m"
+
+
 def bar_color(frac: float) -> str:
-    """막대 칸이나 추이 칸 하나의 색. 그 칸이 나타내는 비율로 정한다."""
-    for upto, code in BAR_STOPS:
-        if frac < upto:
-            return f"{ESC}[38;5;{code}m"
-    return RED
+    """추이 칸 하나의 색. 그 칸이 나타내는 비율로 정한다."""
+    return rgb(bar_rgb(frac))
 
 
 def draw_bar(frac: float, width: int, color: str = "") -> str:
-    """▕███▌····▏ 모양 막대. 양 끝 테두리까지 쳐서 width 칸이다.
+    """━━━━╸───── 모양 막대. width 칸이다.
 
     색을 따로 주지 않으면 칸마다 제 자리의 색을 칠한다. 한 가지 색으로 칠하면
     60% 와 84% 가 똑같은 노랑이라 얼마나 찼는지 막대 길이로만 갈라야 한다.
     """
     frac = max(0.0, min(1.0, frac))
-    inner = max(1, width - 2)
-    filled = frac * inner
+    if USE_ASCII:
+        # 선 글자는 옛 콘솔에서 두 칸으로 그려진다. 테두리를 쳐서 막대 길이가 보이게 한다
+        inner = max(1, width - 2)
+        full = int(frac * inner)
+        return (
+            f"{GRAY}[{RESET}{color or level_color(frac)}{'#' * full}{RESET}"
+            f"{DIM}{'.' * (inner - full)}{RESET}{GRAY}]{RESET}"
+        )
+    filled = frac * width
     full = int(filled)
-    cells = ["█"] * full
-    if full < inner and not USE_ASCII:
-        eighths = int((filled - full) * 8)
-        if eighths > 0:
-            cells.append(BLOCKS[eighths - 1])
-    out, last = [f"{GRAY}▕"], ""
+    cells = [BAR_FILL] * full
+    if full < width and filled - full >= 0.5:
+        cells.append(BAR_HALF)
+    out = []
     for i, ch in enumerate(cells):
-        cell_color = color or bar_color((i + 0.5) / inner)
-        if cell_color != last:  # 색이 바뀌는 칸에서만 색 코드를 넣는다
-            out.append(cell_color)
-            last = cell_color
+        if color:
+            if i == 0:
+                out.append(color)
+        else:
+            # 제 자리의 색에, 막대 끝으로 갈수록 밝아지는 정도를 곱한다
+            ramp = BAR_DIM_START + (1 - BAR_DIM_START) * (i + 1) / len(cells)
+            out.append(rgb(bar_rgb((i + 0.5) / width), ramp))
         out.append(ch)
-    out.append(f"{RESET}{DIM}{'·' * (inner - len(cells))}{RESET}{GRAY}▏{RESET}")
+    out.append(f"{RESET}{BAR_TRACK_COLOR}{BAR_TRACK * (width - len(cells))}{RESET}")
     return "".join(out)
 
 
@@ -1014,15 +1043,18 @@ class Monitor:
         rate_color = f"{YELLOW}{BOLD}" if just_changed else BOLD
         clock = time.strftime("%H:%M:%S")
         admin = "관리자  " if IS_ADMIN else ""
-        right = f"{admin}{clock}  갱신 {rate} "
+        # 메모리 압박은 제목 줄의 색 배지로. 평소엔 한 칸짜리 줄을 따로 차지할 만한 정보가 아니다
+        pressure = f" 메모리 {pressure_text} "
+        right = f"{admin}{pressure}  {clock}  갱신 {rate} "
         name = f" wsc {VERSION}  "
         brand_w = cols - dwidth(name) - dwidth(right) - 2
         brand = dtrunc(CPU_BRAND, brand_w) if brand_w >= 6 else ""
         pad = max(1, cols - dwidth(name) - dwidth(brand) - dwidth(right))
         admin_cell = f"{YELLOW}{BOLD}{admin}{RESET}{HEADER_BG}" if admin else ""
+        badge = f"{PRESSURE_BADGE[pressure_text]}{BOLD}{pressure}{RESET}{HEADER_BG}"
         out.append(
             f"{HEADER_BG}{LOGO_ON_HEADER} wsc {GRAY_ON_HEADER}{VERSION}  {RESET}{HEADER_BG}{brand}"
-            f"{' ' * pad}{admin_cell}{BOLD}{clock}{RESET}{HEADER_BG}  "
+            f"{' ' * pad}{admin_cell}{badge}  {BOLD}{clock}{RESET}{HEADER_BG}  "
             f"{GRAY_ON_HEADER}갱신 {rate_color}{rate} {RESET}"
         )
         out.append("")
@@ -1093,15 +1125,16 @@ class Monitor:
             line += f"  {draw_spark(self.cpu_hist, spark_w)}"
         out.append(line)
 
-        # 메모리. 좁으면 캐시부터 뺀다. 압축이 쌓이는 건 부족 신호라 더 오래 남긴다
+        # 메모리. 좁으면 캐시부터 뺀다. 압축이 쌓이는 건 부족 신호라 더 오래 남긴다.
+        # 압박이 주의·위험이면 무엇이 넘었는지와 할 일을 맨 앞에 경고로 둔다. 배지는 제목 줄에 있다
         mem_frac = mem["used"] / mem["total"] if mem["total"] else 0.0
-        out.append(summary(
-            "메모리", mem_frac, "mem",
-            [
-                (f"압축 {human_bytes(self.compressed)}", GRAY, 2),
-                (f"캐시 {human_bytes(mem['cache'])}", GRAY, 1),
-            ],
-        )[0])
+        mem_extras = [
+            (f"압축 {human_bytes(self.compressed)}", GRAY, 2),
+            (f"캐시 {human_bytes(mem['cache'])}", GRAY, 1),
+        ]
+        if pressure_note:
+            mem_extras.insert(0, (pressure_note, pressure_color, None))
+        out.append(summary("메모리", mem_frac, "mem", mem_extras)[0])
 
         # 커밋 — 프로그램들이 '쓰겠다'고 받아간 메모리 총량. 한계에 닿으면 새 할당이 실패한다
         commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
@@ -1127,14 +1160,6 @@ class Monitor:
             page_note = [("메모리 부족 조짐 — 디스크로 밀려나기 시작", YELLOW, None)]
         page_frac = page_used / page_total if page_total else 0.0
         out.append(summary("페이지", page_frac, "page", page_note, page_color)[0])
-
-        # 압박 — 색 배지 하나로. 설명은 경고일 때만 붙인다
-        badge = f"{PRESSURE_BADGE[pressure_text]}{BOLD} {pressure_text} {RESET}"
-        line = f" {dpad('압박', label_w)}{badge}"
-        if pressure_note:
-            room = cols - (1 + label_w + dwidth(pressure_text) + 2 + 2)
-            line += f"  {pressure_color}{dtrunc(pressure_note, room)}{RESET}"
-        out.append(line)
 
         # 네트워크 — 막대는 회선(링크 속도) 대비 얼마나 쓰고 있나. 받기·보내기 중 큰 쪽으로 그린다.
         # 프로세스별 사용량은 윈도우가 관리자 권한 없이는 알려주지 않아서 전체만 보인다
