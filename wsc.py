@@ -29,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -271,6 +271,9 @@ kernel32.GetConsoleMode.restype = wintypes.BOOL
 kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.SetConsoleMode.restype = wintypes.BOOL
 kernel32.GetConsoleOutputCP.restype = wintypes.UINT
+kernel32.GetConsoleWindow.restype = wintypes.HWND
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -1039,7 +1042,11 @@ class Monitor:
         elif self.net_rate is None:
             values["net"] = ("측정 중", "")
         else:
-            values["net"] = (f"↓{human_rate(self.net_rate[0])}", f"↑{human_rate(self.net_rate[1])}")
+            # 영문 기호 모드에서 화살표를 v ^ 로 바꾸면 무슨 뜻인지 안 읽혀서 낱말로 적는다
+            down, up = ("in ", "out ") if USE_ASCII else ("↓", "↑")
+            values["net"] = (
+                f"{down}{human_rate(self.net_rate[0])}", f"{up}{human_rate(self.net_rate[1])}"
+            )
         # 네트워크 속도는 늘 자릿수가 바뀐다. 가장 긴 모양(↓12.3MB/s)에 맞춰 폭을 고정해 둔다
         left_w = max(9, *(dwidth(v[0]) for v in values.values()))
         right_w = max(9, *(dwidth(v[1]) for v in values.values()))
@@ -1396,13 +1403,31 @@ def restore_console_mode(mode):
         kernel32.SetConsoleMode(kernel32.GetStdHandle(STD_OUTPUT_HANDLE), mode)
 
 
+def on_pseudo_console() -> bool:
+    """의사 콘솔(ConPTY) 위에서 도는가. Windows Terminal·VS Code 같은 요즘 터미널이 이렇다.
+
+    그런 터미널은 콘솔 창 대신 'PseudoConsoleWindow' 라는 숨은 창을 둔다.
+    옛 콘솔 창이면 'ConsoleWindowClass' 다.
+    """
+    hwnd = kernel32.GetConsoleWindow()
+    if not hwnd:
+        return False
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, len(name))
+    return name.value == "PseudoConsoleWindow"
+
+
 def wants_ascii() -> bool:
     """옛 콘솔을 한중일 코드 페이지로 쓰는 중이면 영문 기호로 그린다.
 
     Windows Terminal(WT_SESSION)이나 VS Code 같은 터미널(TERM_PROGRAM)은
-    폭이 애매한 글자를 한 칸으로 그려서 괜찮다.
+    폭이 애매한 글자를 한 칸으로 그려서 괜찮다. 윈도우 11 은 시작 메뉴에서 연
+    PowerShell 도 Windows Terminal 로 넘겨 띄우는데, 그렇게 넘겨받은 창에는
+    WT_SESSION 이 없어서 콘솔 창 종류로 한 번 더 가린다.
     """
     if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
+        return False
+    if on_pseudo_console():
         return False
     return kernel32.GetConsoleOutputCP() in (932, 936, 949, 950)
 
