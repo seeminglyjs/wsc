@@ -29,7 +29,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -106,6 +106,10 @@ BAR_HALF = "╸"  # 반 칸
 BAR_TRACK = "─"
 BAR_TRACK_COLOR = f"{ESC}[38;5;239m"
 BAR_DIM_START = 0.55  # 막대 첫 칸의 밝기. 끝으로 갈수록 밝아져서 짧은 막대도 그라데이션이 보인다
+# 메모리 막대에서 사용 중 뒤에 잇는 캐시 몫. 차분한 파랑이라 '쓰는 중' 과 갈린다.
+# 메모리 줄 옆의 '캐시 N GB' 글자도 같은 색으로 칠해 범례 노릇을 하게 한다
+CACHE_COLOR = f"{ESC}[38;2;74;120;160m"
+CORE_BUSY = 90.0  # 코어 하나가 이만큼 넘게 바쁜데 전체 CPU 는 낮으면 한 스레드 병목으로 본다
 
 # 시작 화면 로고. 글자마다 따로 두고 한 칸씩 띄워 이어 붙인다
 LOGO = (
@@ -229,6 +233,17 @@ class SYSTEM_PAGEFILE_INFORMATION(ctypes.Structure):
     ]
 
 
+class SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("IdleTime", ctypes.c_longlong),
+        ("KernelTime", ctypes.c_longlong),  # 유휴 시간이 들어 있다
+        ("UserTime", ctypes.c_longlong),
+        ("DpcTime", ctypes.c_longlong),
+        ("InterruptTime", ctypes.c_longlong),
+        ("InterruptCount", wintypes.ULONG),
+    ]
+
+
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [
         ("dwLength", wintypes.DWORD),
@@ -315,6 +330,7 @@ user32.PostMessageW.restype = wintypes.BOOL
 STATUS_INFO_LENGTH_MISMATCH = ctypes.c_long(0xC0000004).value
 SYSTEM_PROCESS_INFO = 5
 SYSTEM_PAGEFILE_INFO = 18
+SYSTEM_PROCESSOR_PERFORMANCE_INFO = 8
 ERROR_ACCESS_DENIED = 5
 ERROR_INVALID_PARAMETER = 87
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -434,6 +450,20 @@ def system_times():
         return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
 
     return value(idle), value(kern), value(user)
+
+
+def core_times() -> list:
+    """코어마다 (유휴, 전체) 누적 시간. 못 읽으면 빈 목록.
+
+    코어가 64개를 넘는 기기는 윈도우가 코어를 묶음으로 나누는데, 이 값은 wsc 가 도는
+    묶음 것만 준다. 그런 기기에서는 일부 코어만 보인다.
+    """
+    entry = ctypes.sizeof(SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION)
+    buf, _ = query_system(SYSTEM_PROCESSOR_PERFORMANCE_INFO, entry * NCPU)
+    if buf is None:
+        return []
+    cores = (SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION * NCPU).from_buffer(buf)
+    return [(c.IdleTime, c.KernelTime + c.UserTime) for c in cores if c.KernelTime + c.UserTime]
 
 
 def _tcp_listeners(family: int):
@@ -720,38 +750,65 @@ def bar_color(frac: float) -> str:
     return rgb(bar_rgb(frac))
 
 
-def draw_bar(frac: float, width: int, color: str = "") -> str:
+def draw_bar(frac: float, width: int, color: str = "", extra: float = 0.0) -> str:
     """━━━━╸───── 모양 막대. width 칸이다.
 
     색을 따로 주지 않으면 칸마다 제 자리의 색을 칠한다. 한 가지 색으로 칠하면
     60% 와 84% 가 똑같은 노랑이라 얼마나 찼는지 막대 길이로만 갈라야 한다.
+    extra 는 frac 뒤에 이어 흐리게 칠할 둘째 몫이다 (메모리 막대의 캐시).
     """
     frac = max(0.0, min(1.0, frac))
+    end = max(frac, min(1.0, frac + extra))
     if USE_ASCII:
         # 선 글자는 옛 콘솔에서 두 칸으로 그려진다. 테두리를 쳐서 막대 길이가 보이게 한다
         inner = max(1, width - 2)
         full = int(frac * inner)
+        more = max(full, int(end * inner))
         return (
             f"{GRAY}[{RESET}{color or level_color(frac)}{'#' * full}{RESET}"
-            f"{DIM}{'.' * (inner - full)}{RESET}{GRAY}]{RESET}"
+            f"{CACHE_COLOR}{'=' * (more - full)}{RESET}"
+            f"{DIM}{'.' * (inner - more)}{RESET}{GRAY}]{RESET}"
         )
-    filled = frac * width
-    full = int(filled)
-    cells = [BAR_FILL] * full
-    if full < width and filled - full >= 0.5:
-        cells.append(BAR_HALF)
-    out = []
-    for i, ch in enumerate(cells):
-        if color:
-            if i == 0:
-                out.append(color)
+    # 반 칸 단위로 센다. 끝이 반 칸에 걸리면 ╸ 로 그린다
+    main_h = round(frac * width * 2)
+    end_h = max(main_h, round(end * width * 2))
+    main_cells = (main_h + 1) // 2
+    out, last = [], ""
+    for i in range(width):
+        left, right = 2 * i, 2 * i + 1
+        if left < main_h:
+            if color:
+                cell_color = color
+            else:
+                # 제 자리의 색에, 막대 끝으로 갈수록 밝아지는 정도를 곱한다
+                ramp = BAR_DIM_START + (1 - BAR_DIM_START) * (i + 1) / main_cells
+                cell_color = rgb(bar_rgb((i + 0.5) / width), ramp)
+            glyph = BAR_FILL if right < end_h else BAR_HALF
+        elif left < end_h:
+            cell_color, glyph = CACHE_COLOR, BAR_FILL if right < end_h else BAR_HALF
         else:
-            # 제 자리의 색에, 막대 끝으로 갈수록 밝아지는 정도를 곱한다
-            ramp = BAR_DIM_START + (1 - BAR_DIM_START) * (i + 1) / len(cells)
-            out.append(rgb(bar_rgb((i + 0.5) / width), ramp))
-        out.append(ch)
-    out.append(f"{RESET}{BAR_TRACK_COLOR}{BAR_TRACK * (width - len(cells))}{RESET}")
+            cell_color, glyph = BAR_TRACK_COLOR, BAR_TRACK
+        if cell_color != last:  # 색이 바뀌는 칸에서만 색 코드를 넣는다
+            out.append(cell_color)
+            last = cell_color
+        out.append(glyph)
+    out.append(RESET)
     return "".join(out)
+
+
+def draw_cores(pcts: list, width: int) -> str:
+    """코어마다 한 칸씩 ▁▂▃▅▇ 높이와 색으로. 칸이 모자라면 이웃 코어를 묶어 그중 큰 값을 그린다.
+
+    코어가 적어 자리가 넉넉하면 한 칸씩 띄워 그린다. 붙여 그리면 막대그래프처럼 뭉쳐 보인다.
+    """
+    per = -(-len(pcts) // max(1, width))  # 한 칸에 담을 코어 수 (올림)
+    cells = [max(pcts[i:i + per]) for i in range(0, len(pcts), per)]
+    gap = " " if len(cells) * 2 - 1 <= width else ""
+    out = []
+    for v in cells:
+        level = min(len(SPARKS) - 1, int(v / 100.0 * len(SPARKS)))
+        out.append(f"{bar_color(v / 100.0)}{SPARKS[level]}")
+    return gap.join(out) + RESET
 
 
 def draw_spark(values, width: int) -> str:
@@ -842,6 +899,8 @@ class Monitor:
         self.total_cpu = 0.0
         self.unlisted_cpu = 0.0  # 전체 CPU 중 목록의 어느 프로세스에도 안 잡힌 몫
         self.cpu_hist = collections.deque(maxlen=SPARK_LEN)  # 최근 전체 CPU%. 추이 그래프용
+        self.prev_cores = []  # 지난번 코어별 (유휴, 전체) 누적 시간
+        self.core_pct = []  # 코어별 사용률(%). 두 번 재기 전엔 빈 목록
         self.ready = False
         # 수집 결과는 여기 담아둔다. 키를 눌러 다시 그릴 때 또 읽지 않으려는 것
         self.mem = dict(EMPTY_MEMORY)
@@ -853,7 +912,10 @@ class Monitor:
         self.interval_changed_at = 0.0  # 주기를 바꾼 직후 잠깐 강조하려고 기록
         self.latest_version = ""  # 새 버전 확인 결과. 별도 흐름에서 채운다
         # 프로세스 고르기와 종료 관련
-        self.selected_pid = None  # 줄 번호가 아니라 PID 로 기억한다. 순위가 바뀌어도 따라가게
+        # 같은 이름의 프로세스를 한 줄로 합쳐 보는가. 크롬처럼 여러 개 띄우는 프로그램의 몫이 보인다
+        self.grouped = False
+        # 줄 번호가 아니라 PID 로 기억한다. 순위가 바뀌어도 따라가게. 묶음 보기에서는 이름이다
+        self.selected = None
         self.scroll = 0
         self.visible_rows = 1
         self.ports = {}  # {PID: [포트, ...]}
@@ -902,6 +964,16 @@ class Monitor:
                 self.ready = True
         self.prev_times = times
 
+        # 코어별 사용률. 전체 CPU 가 낮아도 코어 하나가 꽉 차 있으면 그 프로그램은 느리다
+        cores = core_times()
+        if cores and len(cores) == len(self.prev_cores):
+            pcts = []
+            for (idle, total), (idle0, total0) in zip(cores, self.prev_cores):
+                span = total - total0
+                pcts.append(max(0.0, min(100.0, (span - (idle - idle0)) / span * 100.0)) if span > 0 else 0.0)
+            self.core_pct = pcts
+        self.prev_cores = cores
+
         rows = []
         compressed = 0
         elapsed = now - self.prev_t if self.prev_t else 0.0
@@ -942,8 +1014,38 @@ class Monitor:
         self.prev_t = now
 
     def sorted_rows(self):
+        """표에 그릴 줄. (키, CPU%, 메모리, 이름, 묶인 개수, 포트 목록).
+
+        키는 PID, 묶음 보기에서는 이름이다. 묶으면 CPU·메모리·포트를 합친다.
+        """
+        if self.grouped:
+            groups = {}
+            for pid, pct, private, name in self.rows:
+                g = groups.setdefault(name, [name, 0.0, 0, name, 0, []])
+                g[1] += pct
+                g[2] += private
+                g[4] += 1
+                g[5].extend(self.ports.get(pid, []))
+            rows = [tuple(g[:5]) + (sorted(set(g[5])),) for g in groups.values()]
+        else:
+            rows = [(pid, pct, private, name, 1, self.ports.get(pid, [])) for pid, pct, private, name in self.rows]
         idx = 1 if self.sort_key == "cpu" else 2
-        return sorted(self.rows, key=lambda r: r[idx], reverse=True)
+        return sorted(rows, key=lambda r: r[idx], reverse=True)
+
+    def toggle_group(self):
+        """묶음 보기를 켜고 끈다. 고른 줄은 같은 프로세스(또는 그 묶음)로 옮겨 준다."""
+        if self.grouped:
+            # 묶음에서 풀면 그 이름 중 지금 정렬 기준으로 가장 큰 것을 고른다
+            name = self.selected
+            self.grouped = False
+            self.selected = next((r[0] for r in self.sorted_rows() if r[3] == name), None)
+        else:
+            name = next((r[3] for r in self.rows if r[0] == self.selected), None)
+            self.grouped = True
+            self.selected = name
+        self.scroll = 0
+        if self.selected is not None:
+            self.move_selection(0)  # 고른 줄이 화면 안에 들게 굴린다
 
     def set_status(self, text: str, color: str = GRAY):
         self.status = (text, color, time.monotonic())
@@ -952,13 +1054,13 @@ class Monitor:
         rows = self.sorted_rows()
         if not rows:
             return
-        pids = [r[0] for r in rows]
-        if self.selected_pid in pids:
-            index = pids.index(self.selected_pid) + step
+        keys = [r[0] for r in rows]
+        if self.selected in keys:
+            index = keys.index(self.selected) + step
         else:
-            index = 0 if step >= 0 else len(pids) - 1
-        index = max(0, min(len(pids) - 1, index))
-        self.selected_pid = pids[index]
+            index = 0 if step >= 0 else len(keys) - 1
+        index = max(0, min(len(keys) - 1, index))
+        self.selected = keys[index]
 
         # 고른 줄이 화면 밖으로 나가면 따라 굴린다
         if index < self.scroll:
@@ -968,12 +1070,16 @@ class Monitor:
 
     def request_kill(self):
         """확인 단계로 넘긴다. 여기서 막을 건 미리 막는다."""
+        if self.grouped:
+            # 묶음째 끄면 같은 이름의 딴 프로그램까지 휩쓸 수 있다. 하나씩만 끈다
+            self.set_status("묶음 보기에서는 종료 불가 — g 로 풀고 하나씩 고르기", YELLOW)
+            return
         rows = self.sorted_rows()
-        target = next((r for r in rows if r[0] == self.selected_pid), None)
+        target = next((r for r in rows if r[0] == self.selected), None)
         if target is None:
             self.set_status("종료할 프로세스를 ↑↓ 로 먼저 선택", YELLOW)
             return
-        pid, _, _, name = target
+        pid, name = target[0], target[3]
         if pid in PROTECTED_PIDS or name.lower() in PROTECTED_NAMES:
             self.set_status(f"{name} — Windows 핵심 프로세스라 종료 불가 (끄면 블루스크린·재시동)", RED)
             return
@@ -1084,12 +1190,12 @@ class Monitor:
         right_w = max(9, *(dwidth(v[1]) for v in values.values()))
         head_w = 1 + label_w + bar_w + 2 + left_w + 3 + right_w
 
-        def summary(label, frac, key, extras, color="", reserve=0, sep=" / "):
+        def summary(label, frac, key, extras, color="", reserve=0, sep=" / ", extra=0.0):
             used_text, total_text = values[key]
             total_cell = f"{sep}{dpad(total_text, right_w)}" if total_text else " " * (3 + right_w)
             tail, used = fit_extras(head_w + reserve, extras, cols)
             line = (
-                f" {dpad(label, label_w)}{draw_bar(frac, bar_w, color)}  "
+                f" {dpad(label, label_w)}{draw_bar(frac, bar_w, color, extra)}  "
                 f"{BOLD}{rpad(used_text, left_w)}{total_cell}{RESET}{tail}"
             )
             return line, used - reserve
@@ -1125,16 +1231,45 @@ class Monitor:
             line += f"  {draw_spark(self.cpu_hist, spark_w)}"
         out.append(line)
 
+        # 코어별 — 전체 CPU 가 낮은데 느리면 코어 하나가 꽉 찬 경우가 많다 (한 스레드로만 도는
+        # 프로그램, 무한 루프). 평균에 묻히는 걸 한 칸씩 펼쳐 보인다. 막대와 같은 세로줄에서 시작한다
+        if self.core_pct:
+            # 막대부터 값 칸 끝까지를 쓴다. 뒤의 설명이 다른 줄의 회색 정보와 같은 세로줄에 선다
+            area_w = head_w - 1 - label_w
+            strip = draw_cores(self.core_pct, area_w)
+            strip_w = dwidth(ANSI_RE.sub("", strip))
+            busiest = max(range(len(self.core_pct)), key=self.core_pct.__getitem__)
+            top = self.core_pct[busiest]
+            # (긴 설명, 짧은 설명). 좁으면 짧은 쪽을 쓴다. 긴 걸 자르면 정작 몇 번 코어인지가 잘린다
+            if top >= CORE_BUSY and self.total_cpu < 50:
+                notes = (f"코어 #{busiest} {top:.0f}% — 한 프로그램이 코어 하나를 꽉 씀", f"#{busiest} {top:.0f}% 꽉 참")
+                note_color = YELLOW
+            else:
+                notes = (f"가장 바쁜 코어 #{busiest} {top:.0f}%", f"최고 #{busiest} {top:.0f}%")
+                note_color = GRAY
+            room = cols - head_w - 2
+            note = notes[0] if dwidth(notes[0]) <= room else notes[1]
+            line = f" {dpad('코어', label_w)}{strip}{' ' * max(0, area_w - strip_w)}"
+            if room >= 6:
+                line += f"  {note_color}{dtrunc(note, room)}{RESET}"
+            out.append(line)
+        else:
+            out.append(f" {dpad('코어', label_w)}{DIM}측정 중{RESET}")
+
         # 메모리. 좁으면 캐시부터 뺀다. 압축이 쌓이는 건 부족 신호라 더 오래 남긴다.
+        # 막대는 사용 중 뒤에 캐시를 흐린 파랑으로 잇는다. 캐시는 필요하면 바로 내주는 몫이라
+        # 막대가 길어 보여도 파란 데까지는 여유다. 옆의 '캐시' 글자를 같은 색으로 칠해 범례로 쓴다.
         # 압박이 주의·위험이면 무엇이 넘었는지와 할 일을 맨 앞에 경고로 둔다. 배지는 제목 줄에 있다
         mem_frac = mem["used"] / mem["total"] if mem["total"] else 0.0
+        # 캐시는 대부분 '사용 가능' 안에 들어 있다. 남은 자리보다 크게는 못 그린다
+        cache_frac = min(mem["cache"], mem["total"] - mem["used"]) / mem["total"] if mem["total"] else 0.0
         mem_extras = [
             (f"압축 {human_bytes(self.compressed)}", GRAY, 2),
-            (f"캐시 {human_bytes(mem['cache'])}", GRAY, 1),
+            (f"캐시 {human_bytes(mem['cache'])}", CACHE_COLOR, 1),
         ]
         if pressure_note:
             mem_extras.insert(0, (pressure_note, pressure_color, None))
-        out.append(summary("메모리", mem_frac, "mem", mem_extras)[0])
+        out.append(summary("메모리", mem_frac, "mem", mem_extras, extra=cache_frac)[0])
 
         # 커밋 — 프로그램들이 '쓰겠다'고 받아간 메모리 총량. 한계에 닿으면 새 할당이 실패한다
         commit_frac = mem["commit"] / mem["commit_limit"] if mem["commit_limit"] else 0.0
@@ -1197,8 +1332,10 @@ class Monitor:
         else:
             mem_hdr = f"{BOLD}{mem_hdr}{RESET}{HEADER_BG}"
         port_hdr = f"{dpad('포트', port_w)}  " if port_w else ""
+        # 묶음 보기에서는 PID 자리에 몇 개를 합쳤는지 적는다
+        first_hdr = rpad("개수" if self.grouped else "PID", 7)
         out.append(
-            f"{HEADER_BG} {rpad('PID', 7)}  {cpu_hdr}  {mem_hdr}  "
+            f"{HEADER_BG} {first_hdr}  {cpu_hdr}  {mem_hdr}  "
             f"{port_hdr}{dpad('이름', name_w)}{RESET}"
         )
 
@@ -1219,17 +1356,18 @@ class Monitor:
             shown = f"{self.scroll + 1}–{min(self.scroll + limit, len(rows))}"
             count_note = f" {shown}/{len(rows)}"
 
-        for idx, (pid, pct, private, name) in enumerate(window):
+        for idx, (key, pct, private, name, count, ports) in enumerate(window):
             last_row = idx == len(window) - 1
             col_w = max(6, name_w - dwidth(count_note)) if last_row else name_w
-            chosen = pid == self.selected_pid
-            port_text = format_ports(self.ports.get(pid, [])) if port_w else ""
+            chosen = key == self.selected
+            port_text = format_ports(ports) if port_w else ""
             name_cell = dpad(name, col_w)
+            first = f"×{count}" if self.grouped else str(key)
             if chosen:
                 # 고른 줄은 색을 다 빼고 흰 글씨 하나로. 파란 바탕 위 색 글자는 안 읽힌다
                 port_cell = f"{dpad(port_text, port_w)}  " if port_w else ""
                 body = (
-                    f"›{pid:>7}  {pct:>7.1f}  {human_bytes(private):>8}  "
+                    f"›{first:>7}  {pct:>7.1f}  {human_bytes(private):>8}  "
                     f"{port_cell}{name_cell}"
                 )
                 line = f"{SELECT_BG}{BOLD}{body}{RESET}"
@@ -1239,8 +1377,10 @@ class Monitor:
                     port_color = CYAN if port_text else DIM
                     port_cell = f"{port_color}{dpad(port_text, port_w)}{RESET}  "
                 mem_color = proc_mem_color(private, mem["total"])
+                # 하나뿐인 묶음은 흐리게. 여러 개 합친 줄이 눈에 걸리게 한다
+                first_color = GRAY if self.grouped and count == 1 else ""
                 line = (
-                    f" {pid:>7}  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
+                    f" {first_color}{first:>7}{RESET}  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
                     f"{mem_color}{human_bytes(private):>8}{RESET}  "
                     f"{port_cell}{dim_ext(name_cell)}"
                 )
@@ -1280,6 +1420,7 @@ class Monitor:
             ("k", "종료시키기", "종료", False, False),
             ("c", "CPU순", "CPU", False, self.sort_key == "cpu"),
             ("m", "메모리순", "메모리", False, self.sort_key == "mem"),
+            ("g", "이름별 묶기", "묶기", False, self.grouped),
             ("+/-", "갱신 간격", "간격", False, False),
             ("q", "나가기", "끝", True, False),
         ]
@@ -1360,7 +1501,9 @@ class Monitor:
         elif key in ("k", "K"):
             self.request_kill()
         elif key == "ESC":
-            self.selected_pid = None
+            self.selected = None
+        elif key in ("g", "G"):
+            self.toggle_group()
         elif key in ("c", "C"):
             self.sort_key = "cpu"
         elif key in ("m", "M"):
