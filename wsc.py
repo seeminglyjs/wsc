@@ -31,7 +31,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -190,6 +190,13 @@ LOGO_FLASH = 0.08  # 굳은 직후 하얗게 번쩍이는 동안 (해독 진행 
 LOGO_NOISE_COLOR = f"{ESC}[38;2;64;150;170m"
 LOGO_FLASH_COLOR = f"{ESC}[38;2;235;250;255m"
 LOGO_JITTER = tuple(random.Random(7).random() for _ in range(97))  # 칸마다 굳는 때를 어긋나게 할 고정 난수
+# 나갈 때 연출. 옛 브라운관 TV 를 끄듯 화면이 위아래로 눌려 빛나는 가로줄 하나가 되고,
+# 그 줄이 가운데 한 점으로 줄어든 뒤 꺼진다. 단계마다 걸리는 초
+OUTRO_SQUEEZE = 0.24
+OUTRO_SHRINK = 0.2
+OUTRO_FADE = 0.16
+OUTRO_LINE = (235, 250, 255)  # 눌린 줄의 색. 줄어들수록 로고 하늘색으로 식는다
+OUTRO_EMBER = (95, 215, 255)
 
 # 옛 콘솔(conhost)을 한중일 코드 페이지로 쓰면 █ · … 같은 '폭이 애매한' 글자를
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
@@ -2526,6 +2533,64 @@ def show_splash(monitor: Monitor):
             return
 
 
+def render_outro(grid: list, cols: int, rows: int, t: float) -> list:
+    """나갈 때 연출의 한 장. grid 는 마지막 화면을 칸으로 푼 것, t 는 연출 시작 뒤 흐른 초."""
+    out = [""] * rows
+    mid = rows // 2
+    white = (255, 255, 255)
+    line_glyph = "=" if USE_ASCII else "━"
+
+    def mix(a, b, k):
+        return tuple(round(x + (y - x) * k) for x, y in zip(a, b))
+
+    if t < OUTRO_SQUEEZE:
+        # 위아래로 눌린다. 처음엔 천천히, 끝에선 확 닫힌다. 눌릴수록 글자가 하얗게 달아오른다
+        s = t / OUTRO_SQUEEZE
+        height = max(1, round(rows * (1 - s * s)))
+        top = mid - height // 2
+        glow = 0.9 * s
+        for i in range(height):
+            src = grid[min(rows - 1, i * rows // height)]
+            out[top + i] = from_cells([
+                [ch, (mix(fg or DEFAULT_FG, white, glow), bg and mix(bg, (0, 0, 0), s), bold)]
+                for ch, (fg, bg, bold) in src
+            ])
+        return out
+    t -= OUTRO_SQUEEZE
+    if t < OUTRO_SHRINK:
+        # 빛나는 가로줄이 가운데로 줄어든다
+        s = ease_out(t / OUTRO_SHRINK)
+        width = max(1, round(cols * (1 - s)))
+        out[mid] = " " * ((cols - width) // 2) + rgb(mix(OUTRO_LINE, OUTRO_EMBER, s)) + line_glyph * width + RESET
+        return out
+    # 남은 한 점이 사그라든다
+    s = min(1.0, (t - OUTRO_SHRINK) / OUTRO_FADE)
+    out[mid] = " " * (cols // 2) + rgb(OUTRO_EMBER, 1 - s) + line_glyph + RESET
+    return out
+
+
+def play_outro(monitor: Monitor):
+    """q 로 나갈 때 브라운관 TV 를 끄듯 화면을 닫는다. 아무 키나 누르면 바로 끝낸다."""
+    size = term_size()
+    cols, rows = size.columns, size.lines
+    lines = monitor.render(cols, rows)[:rows]
+    grid = [to_cells(line, cols) for line in lines]
+    while len(grid) < rows:
+        grid.append(to_cells("", cols))
+    total = OUTRO_SQUEEZE + OUTRO_SHRINK + OUTRO_FADE
+    start = time.monotonic()
+    while True:
+        t = time.monotonic() - start
+        if t >= total:
+            break
+        draw(render_outro(grid, cols, rows, t), cols, rows)
+        if key_waiting(FRAME_SECONDS):
+            while msvcrt.kbhit():  # 누른 키는 먹어 둔다. 남기면 나간 뒤 셸에 찍힌다
+                msvcrt.getwch()
+            break
+    draw([""] * rows, cols, rows)
+
+
 def print_version() -> int:
     """--version. 터미널이면 로고와 함께, 파일·파이프면 한 줄로 찍는다 (스크립트가 읽기 쉽게)."""
     plain = f"wsc {VERSION}  {REPO_URL}"
@@ -2602,6 +2667,9 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
                         quit_now = True
                         break
                 if quit_now:
+                    # 로고를 띄우는 설정이면 나갈 때도 연출로 닫는다. --no-logo 면 바로 나간다
+                    if show_logo and not USE_ASCII:
+                        play_outro(monitor)
                     break
                 # 주기를 바꿨으면 다음 갱신 시점도 다시 잡는다
                 deadline = min(deadline, time.monotonic() + monitor.interval)
@@ -2831,7 +2899,7 @@ def main():
     parser.add_argument(
         "--no-check", action="store_true", help="실행할 때 새 버전 확인을 건너뛴다"
     )
-    parser.add_argument("--no-logo", action="store_true", help="시작 로고를 건너뛴다")
+    parser.add_argument("--no-logo", action="store_true", help="시작 로고와 나갈 때 연출을 건너뛴다")
     args = parser.parse_args()
 
     if args.version:
