@@ -30,7 +30,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -47,6 +47,12 @@ CURSOR_SHOW = f"{ESC}[?25h"
 CURSOR_HOME = f"{ESC}[H"
 CLEAR_LINE = f"{ESC}[K"
 CLEAR_BELOW = f"{ESC}[J"
+# 한 장을 다 받을 때까지 화면에 안 그리게 하는 묶음 (동기화 출력). 애니메이션 중 반쯤 그린
+# 화면이 비치는 걸 막는다. 모르는 터미널은 그냥 무시한다
+SYNC_ON = f"{ESC}[?2026h"
+SYNC_OFF = f"{ESC}[?2026l"
+BEL = "\x07"
+TASKBAR_CLEAR = f"{ESC}]9;4;0;0{BEL}"  # 작업 표시줄 아이콘의 진행 막대를 걷는다
 
 RESET = f"{ESC}[0m"
 BOLD = f"{ESC}[1m"
@@ -85,7 +91,21 @@ PROTECTED_NAMES = {
 PROTECTED_PIDS = {0, 4}  # 0 은 유휴 프로세스, 4 는 커널(System)
 
 SPARKS = "▁▂▃▄▅▆▇█"
-SPARK_LEN = 20  # CPU 추이로 보여줄 최근 갱신 횟수
+SPARK_LEN = 20  # CPU 줄 끝의 추이로 보여줄 최근 갱신 횟수
+CPU_HIST_MAX = 1000  # 추이 그래프용으로 기억할 CPU% 개수. 아주 넓은 창도 끝까지 채운다
+# 추이 그래프는 점자 글자(⣿)로 그린다. 한 칸에 점이 가로 2 × 세로 4 라서 ▁▂▃ 보다
+# 가로로 두 배 많은 기록이 들어가고, 여러 줄로 쌓으면 점이 이어져 면적 그래프가 된다.
+# 왼쪽 열 점과 오른쪽 열 점을 아래에서부터 위로 차례로 적은 비트다
+BRAILLE_LEFT = (0x40, 0x04, 0x02, 0x01)
+BRAILLE_RIGHT = (0x80, 0x20, 0x10, 0x08)
+BRAILLE_BASE = 0x2800
+GRAPH_BASELINE = "⣀"  # 값이 0 인 자리에 까는 바닥 선
+# 그래프 높이(줄 수)를 창 높이로 정한다. (이 줄 수 이상이면, 이만큼). 낮으면 안 그리고 CPU 줄 끝 추이로 대신한다
+GRAPH_HEIGHTS = ((34, 3), (27, 2))
+
+# 측정값이 바뀌면 막대와 숫자를 툭 바꾸지 않고 이만큼(초)에 걸쳐 미끄러지게 옮긴다
+TWEEN_SECONDS = 0.45
+FRAME_SECONDS = 1 / 30  # 옮기는 동안 화면을 다시 그리는 간격
 # 전체 CPU 에서 프로세스 몫을 뺀 나머지가 이만큼(%p) 넘으면 CPU 줄에 띄운다. 평소에도
 # 인터럽트 처리 같은 게 몇 %p 는 남아서, 그보다 확실히 클 때만 보이게 한다
 UNLISTED_WARN = 10.0
@@ -140,6 +160,9 @@ ASCII_MAP = str.maketrans({
     "▁": "_", "▂": ".", "▃": ":", "▄": "-", "▅": "=", "▆": "+", "▇": "*",
 })
 USE_ASCII = False
+# 작업 표시줄 아이콘에 CPU 막대를 띄우는가. Windows Terminal 이 알아듣는 OSC 9;4 를 쓴다.
+# 다른 터미널 몇몇(WezTerm 등)은 OSC 9 를 알림 띄우기로 써서, 자기 이름을 밝힌 터미널에는 안 보낸다
+TASKBAR = False
 
 
 # ── 문자열 폭 계산 (한글·CJK 는 두 칸 차지) ────────────────────
@@ -301,6 +324,10 @@ kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.SetConsoleMode.restype = wintypes.BOOL
 kernel32.GetConsoleOutputCP.restype = wintypes.UINT
 kernel32.GetConsoleWindow.restype = wintypes.HWND
+kernel32.GetConsoleTitleW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+kernel32.GetConsoleTitleW.restype = wintypes.DWORD
+kernel32.SetConsoleTitleW.argtypes = [wintypes.LPCWSTR]
+kernel32.SetConsoleTitleW.restype = wintypes.BOOL
 user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetClassNameW.restype = ctypes.c_int
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -838,6 +865,81 @@ def draw_spark(values, width: int) -> str:
     return "".join(out) + RESET
 
 
+def draw_graph(values, width: int, height: int) -> list:
+    """최근 CPU% 를 점자 글자 면적 그래프로. height 줄, width 칸이고 한 칸에 기록 둘이 들어간다.
+
+    눈금은 추이처럼 0~100% 고정이다. 새 값이 오른쪽 끝에 붙고 옛 값은 왼쪽으로 밀려난다.
+    색은 높이로 칠한다. 아래는 초록, 위로 갈수록 노랑·빨강이라 꼭대기 색만 봐도 얼마나 튀었는지 안다.
+    """
+    dots = height * 4
+    values = list(values)[-width * 2:]
+    # 기록이 모자라면 왼쪽을 비워 둔다. 오른쪽 끝이 늘 '지금'이다
+    levels = [None] * (width * 2 - len(values)) + [
+        max(1, round(v / 100.0 * dots)) if v > 0.5 else 0 for v in values
+    ]
+    rows = []
+    for row in range(height):
+        floor = (height - 1 - row) * 4  # 이 줄 맨 아래 점이 몇 번째 점인가
+        color = rgb(bar_rgb((floor + 2) / dots))
+        out, last = [], ""
+        for i in range(width):
+            pair = levels[2 * i], levels[2 * i + 1]
+            bits = 0
+            for level, column in zip(pair, (BRAILLE_LEFT, BRAILLE_RIGHT)):
+                for k in range(max(0, min(4, (level or 0) - floor))):
+                    bits |= column[k]
+            if bits:
+                glyph, cell_color = chr(BRAILLE_BASE + bits), color
+            elif row == height - 1 and pair != (None, None):
+                glyph, cell_color = GRAPH_BASELINE, BAR_TRACK_COLOR
+            else:
+                glyph, cell_color = " ", ""
+            if cell_color and cell_color != last:
+                out.append(cell_color)
+                last = cell_color
+            out.append(glyph)
+        out.append(RESET)
+        rows.append("".join(out))
+    return rows
+
+
+class Tween:
+    """측정값 사이를 부드럽게 잇는다. 새 값이 오면 지금 보이는 값에서 출발해 TWEEN_SECONDS 동안 다가간다.
+
+    측정은 몇 초에 한 번이지만 화면은 그사이 여러 번 그려서, 막대가 툭툭 끊기지 않고 미끄러진다.
+    꺼 두면 늘 새 값을 바로 돌려준다 (파일로 내보낼 때).
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.items = {}  # {이름: (출발 값, 목표 값, 출발 시각)}
+
+    def set(self, name, target: float, now: float):
+        # 처음 보는 값은 0 에서 차오른다. 첫 화면이 뜰 때 막대가 한꺼번에 채워지는 연출이 된다
+        if not self.enabled:
+            start = target
+        else:
+            start = self.get(name, now) if name in self.items else 0.0
+        self.items[name] = (start, target, now)
+
+    def get(self, name, now: float, default: float = 0.0) -> float:
+        item = self.items.get(name)
+        if item is None:
+            return default
+        start, target, began = item
+        t = (now - began) / TWEEN_SECONDS
+        if not self.enabled or t >= 1.0:
+            return target
+        t = max(0.0, t)
+        return start + (target - start) * (1 - (1 - t) ** 3)  # 처음엔 빠르고 끝에서 살며시 멈춘다
+
+    def busy(self, now: float) -> bool:
+        return self.enabled and any(
+            now - began < TWEEN_SECONDS and start != target
+            for start, target, began in self.items.values()
+        )
+
+
 def logo_lines() -> tuple:
     """색을 입힌 로고 줄 목록과 그 폭. 영문 기호 모드면 영문판을 쓴다."""
     glyphs = LOGO_ASCII if USE_ASCII else LOGO
@@ -913,7 +1015,12 @@ class Monitor:
         self.rows = []
         self.total_cpu = 0.0
         self.unlisted_cpu = 0.0  # 전체 CPU 중 목록의 어느 프로세스에도 안 잡힌 몫
-        self.cpu_hist = collections.deque(maxlen=SPARK_LEN)  # 최근 전체 CPU%. 추이 그래프용
+        self.cpu_hist = collections.deque(maxlen=CPU_HIST_MAX)  # 최근 전체 CPU%. 추이 그래프용
+        self.cpu_hist_at = collections.deque(maxlen=CPU_HIST_MAX)  # 위 값을 잰 시각. 그래프가 몇 분치인지 적는다
+        # 화면에 그리는 값. 측정값을 따라 미끄러진다. 대화형 화면에서만 켠다
+        self.tween = Tween()
+        # 대화형 화면인가. 점자 그래프처럼 파일로 내보내면 깨지는 것은 이때만 그린다
+        self.live = False
         self.prev_cores = []  # 지난번 코어별 (유휴, 전체) 누적 시간
         self.core_pct = []  # 코어별 사용률(%). 두 번 재기 전엔 빈 목록
         self.ready = False
@@ -977,6 +1084,7 @@ class Monitor:
             if busy_all > 0:
                 self.total_cpu = max(0.0, min(100.0, (busy_all - idle) / busy_all * 100.0))
                 self.cpu_hist.append(self.total_cpu)
+                self.cpu_hist_at.append(now)
                 self.ready = True
         self.prev_times = times
 
@@ -1028,6 +1136,20 @@ class Monitor:
         self.rows = rows
         self.prev = {pid: (p[0], p[1]) for pid, p in procs.items()}
         self.prev_t = now
+
+        # 화면 값이 따라갈 목표를 새로 건다
+        tw = self.tween
+        tw.set("cpu", self.total_cpu, now)
+        for i, pct in enumerate(self.core_pct):
+            tw.set(("core", i), pct, now)
+        mem = self.mem
+        tw.set("mem", mem["used"], now)
+        tw.set("cache", mem["cache"], now)
+        tw.set("commit", mem["commit"], now)
+        tw.set("page", self.pagefile[0], now)
+        if self.net_rate:
+            tw.set("down", self.net_rate[0], now)
+            tw.set("up", self.net_rate[1], now)
 
     def sorted_rows(self):
         """표에 그릴 줄. (키, CPU%, 메모리, 이름, 묶인 개수, 포트 목록, PID).
@@ -1159,6 +1281,24 @@ class Monitor:
             self.set_status(f"{who} — {how}", GREEN)
             self.needs_refresh = True
 
+    def window_signals(self) -> str:
+        """창 제목과 작업 표시줄 아이콘에 띄울 제어 문자. 측정값이 바뀔 때만 다시 보낸다.
+
+        제목에는 CPU·메모리를 적고, 작업 표시줄 아이콘에는 CPU% 를 진행 막대로 채운다.
+        막대 색은 CPU 막대의 노랑·빨강 기준을 따른다. 창을 내려 둬도 아이콘만 보고 바쁜지 안다.
+        """
+        if not self.ready:
+            return ""
+        mem = self.mem
+        mem_pct = mem["used"] / mem["total"] * 100.0 if mem["total"] else 0.0
+        out = f"{ESC}]2;wsc · CPU {self.total_cpu:.0f}% · 메모리 {mem_pct:.0f}%{BEL}"
+        if TASKBAR:
+            # 상태 1 초록, 4 노랑(일시 정지 색), 2 빨강(오류 색). 0% 는 막대가 안 보여서 1 칸은 채운다
+            frac = self.total_cpu / 100.0
+            state = 2 if frac >= 0.85 else 4 if frac >= 0.60 else 1
+            out += f"{ESC}]9;4;{state};{max(1, round(self.total_cpu))}{BEL}"
+        return out
+
     def render(self, cols: int, lines: int) -> list:
         cols = max(52, cols)
         mem = self.mem
@@ -1168,6 +1308,26 @@ class Monitor:
         bar_w = max(12, min(28, cols - 50))
         label_w = 9  # '네트워크' 가 8칸이다
         out = []
+
+        # 막대와 숫자는 측정값을 따라 미끄러지는 값으로 그린다. 경고·색 기준은 실제 측정값으로 본다.
+        # 한창 옮겨 가는 중간값으로 경고를 띄웠다 거뒀다 하면 깜빡인다
+        now = time.monotonic()
+
+        def shown(name, actual):
+            return self.tween.get(name, now, actual)
+
+        cpu_now = shown("cpu", self.total_cpu)
+        mem_used = shown("mem", mem["used"])
+        mem_cache = shown("cache", mem["cache"])
+        commit_used = shown("commit", mem["commit"])
+        page_shown = shown("page", page_used)
+        net_shown = None
+        if self.net_rate:
+            net_shown = (shown("down", self.net_rate[0]), shown("up", self.net_rate[1]))
+        # 창이 넉넉히 높으면 CPU 추이를 점자 그래프로 크게 그린다. 그때는 CPU 줄 끝의 작은 추이를 뺀다
+        graph_h = 0
+        if self.live and not USE_ASCII:
+            graph_h = next((h for at_least, h in GRAPH_HEIGHTS if lines >= at_least), 0)
 
         # 제목 줄
         # 폭 계산은 색 코드를 뺀 순수 글자로만 한다. 오른쪽 정보가 먼저고, 남는 자리에 CPU 이름을 넣는다
@@ -1201,11 +1361,11 @@ class Monitor:
         # 값 칸은 '쓰는 양 / 전체' 두 칸으로 나눠 폭을 고정한다. 앞 숫자끼리 오른쪽 끝이 맞고,
         # 뒤의 회색 정보도 한 세로줄에 선다. 자릿수가 바뀔 때마다 줄이 들썩이지도 않는다
         values = {
-            "cpu": (f"{self.total_cpu:.1f}%" if self.ready else "측정 중", ""),
-            "mem": (human_bytes(mem["used"]), human_bytes(mem["total"])),
-            "commit": (human_bytes(mem["commit"]), human_bytes(mem["commit_limit"])),
+            "cpu": (f"{cpu_now:.1f}%" if self.ready else "측정 중", ""),
+            "mem": (human_bytes(mem_used), human_bytes(mem["total"])),
+            "commit": (human_bytes(commit_used), human_bytes(mem["commit_limit"])),
             "page": (
-                (human_bytes(page_used), human_bytes(page_total)) if page_total else ("꺼 둠", "")
+                (human_bytes(page_shown), human_bytes(page_total)) if page_total else ("꺼 둠", "")
             ),
         }
         if not self.net_links:
@@ -1216,7 +1376,7 @@ class Monitor:
             # 영문 기호 모드에서 화살표를 v ^ 로 바꾸면 무슨 뜻인지 안 읽혀서 낱말로 적는다
             down, up = ("in ", "out ") if USE_ASCII else ("↓", "↑")
             values["net"] = (
-                f"{down}{human_rate(self.net_rate[0])}", f"{up}{human_rate(self.net_rate[1])}"
+                f"{down}{human_rate(net_shown[0])}", f"{up}{human_rate(net_shown[1])}"
             )
         # 네트워크 속도는 늘 자릿수가 바뀐다. 가장 긴 모양(↓12.3MB/s)에 맞춰 폭을 고정해 둔다
         left_w = max(9, *(dwidth(v[0]) for v in values.values()))
@@ -1240,7 +1400,7 @@ class Monitor:
         # CPU — 윈도우에는 부하 평균이 없어서 그 자리에 프로세스·스레드 수를 둔다.
         # 끝에는 최근 추이를 붙인다. 방금 튄 건지 계속 높은 건지가 한눈에 갈린다.
         # 추이 자리를 먼저 떼어 두고, 남는 폭에 회색 정보를 순위대로 채운다
-        spark_room = 2 + 12 if len(self.cpu_hist) >= 2 else 0
+        spark_room = 2 + 12 if len(self.cpu_hist) >= 2 and not graph_h else 0
         cpu_extras = [
             (f"{NCPU}코어", GRAY, 3),
             (f"프로세스 {mem['processes']}", GRAY, 2),
@@ -1261,7 +1421,7 @@ class Monitor:
             if with_hint + spark_room > cols >= with_hint or with_warn + spark_room > cols:
                 spark_room = 0
         line, used = summary(
-            "CPU", self.total_cpu / 100.0, "cpu", cpu_extras, reserve=spark_room,
+            "CPU", cpu_now / 100.0, "cpu", cpu_extras, reserve=spark_room,
         )
         spark_w = min(SPARK_LEN, cols - used - 2)
         if spark_room and spark_w >= 8:
@@ -1273,7 +1433,8 @@ class Monitor:
         if self.core_pct:
             # 막대부터 값 칸 끝까지를 쓴다. 설명 글은 붙이지 않는다. 코어 하나가 잠깐씩 꽉 차는 건
             # 흔해서, 글로 띄우면 수시로 깜빡이는 경고가 되고 정작 볼 건 칸 높이로 충분히 보인다
-            strip = draw_cores(self.core_pct, head_w - 1 - label_w)
+            cores = [shown(("core", i), pct) for i, pct in enumerate(self.core_pct)]
+            strip = draw_cores(cores, head_w - 1 - label_w)
             out.append(f" {dpad('코어', label_w)}{strip}")
         else:
             out.append(f" {dpad('코어', label_w)}{DIM}측정 중{RESET}")
@@ -1282,9 +1443,9 @@ class Monitor:
         # 막대는 사용 중 뒤에 캐시를 흐린 파랑으로 잇는다. 캐시는 필요하면 바로 내주는 몫이라
         # 막대가 길어 보여도 파란 데까지는 여유다. 옆의 '캐시' 글자를 같은 색으로 칠해 범례로 쓴다.
         # 압박이 주의·위험이면 무엇이 넘었는지와 할 일을 맨 앞에 경고로 둔다. 배지는 제목 줄에 있다
-        mem_frac = mem["used"] / mem["total"] if mem["total"] else 0.0
+        mem_frac = mem_used / mem["total"] if mem["total"] else 0.0
         # 캐시는 대부분 '사용 가능' 안에 들어 있다. 남은 자리보다 크게는 못 그린다
-        cache_frac = min(mem["cache"], mem["total"] - mem["used"]) / mem["total"] if mem["total"] else 0.0
+        cache_frac = min(mem_cache, mem["total"] - mem_used) / mem["total"] if mem["total"] else 0.0
         mem_extras = [
             (f"압축 {human_bytes(self.compressed)}", GRAY, 2),
             (f"캐시 {human_bytes(mem['cache'])}", CACHE_COLOR, 1),
@@ -1304,7 +1465,8 @@ class Monitor:
             ]
         elif commit_frac >= 0.80:
             commit_note = [(f"한계까지 {commit_left} 남음", YELLOW, None)]
-        out.append(summary("커밋", commit_frac, "commit", commit_note)[0])
+        commit_bar = commit_used / mem["commit_limit"] if mem["commit_limit"] else 0.0
+        out.append(summary("커밋", commit_bar, "commit", commit_note)[0])
 
         # 페이지 파일 — 맥의 스왑. 비율보다 절대량이 중요해서 색도 양으로 정한다
         page_note = []
@@ -1315,7 +1477,7 @@ class Monitor:
         elif page_used >= 1024**3:
             page_color = YELLOW
             page_note = [("메모리 부족 조짐 — 디스크로 밀려나기 시작", YELLOW, None)]
-        page_frac = page_used / page_total if page_total else 0.0
+        page_frac = page_shown / page_total if page_total else 0.0
         out.append(summary("페이지", page_frac, "page", page_note, page_color)[0])
 
         # 네트워크 — 막대를 반으로 갈라 왼쪽은 받기(↓), 오른쪽은 보내기(↑). 한 막대에 둘 중
@@ -1333,8 +1495,8 @@ class Monitor:
                     down * 8 / rx_link if rx_link else 0.0,
                     up * 8 / tx_link if tx_link else 0.0,
                 )
-                rx_frac = log_frac(down, rx_link / 8)
-                tx_frac = log_frac(up, tx_link / 8)
+                rx_frac = log_frac(net_shown[0], rx_link / 8)
+                tx_frac = log_frac(net_shown[1], tx_link / 8)
             if net_frac >= 0.85:
                 net_extras.append(("회선이 거의 가득 참 — 내려받기·화상회의가 느려질 수 있음", YELLOW, None))
             first = self.net_links[0]
@@ -1355,6 +1517,24 @@ class Monitor:
             "네트워크", net_frac, "net", net_extras, sep="   ",
             bar=net_bar, value_colors=(NET_DOWN, NET_UP),
         )[0])
+
+        # CPU 추이 그래프. 막대와 같은 세로줄에서 시작해 창 오른쪽 끝까지 쓴다.
+        # 맨 오른쪽 값은 미끄러지는 CPU 값이라, 새 값이 올 때 그래프 끝이 스르르 솟거나 내려앉는다
+        if graph_h:
+            graph_w = cols - 1 - label_w
+            hist = list(self.cpu_hist)[-graph_w * 2:]
+            if hist:
+                hist[-1] = cpu_now
+            # 첫 줄엔 이름을, 끝 줄엔 그래프가 몇 초(분)치인지를 적는다
+            labels = [""] * graph_h
+            labels[0] = dpad("CPU 추이", label_w)
+            shown_at = list(self.cpu_hist_at)[-len(hist):]
+            if len(shown_at) >= 2:
+                span = shown_at[-1] - shown_at[0]
+                span_text = f"{span / 60:.0f}분" if span >= 90 else f"{span:.0f}초"
+                labels[-1] = f"{GRAY}{dpad(span_text, label_w)}{RESET}"
+            for label, row in zip(labels, draw_graph(hist, graph_w, graph_h)):
+                out.append(f" {label or ' ' * label_w}{row}")
         out.append(f"{DIM}{'─' * cols}{RESET}")  # 기기 전체 상태와 프로세스 표를 가른다
 
         # 프로세스 표
@@ -1699,7 +1879,7 @@ def draw(lines_out, cols: int, rows: int):
     )
     if USE_ASCII:
         frame = frame.translate(ASCII_MAP)
-    sys.stdout.write(frame)
+    sys.stdout.write(SYNC_ON + frame + SYNC_OFF)
     sys.stdout.flush()
 
 
@@ -1767,6 +1947,11 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
 
     sys.stdout.write(ALT_SCREEN_ON + CURSOR_HIDE)
     sys.stdout.flush()
+    # 창 제목은 측정값으로 바꿔 쓰다가 나갈 때 원래대로 돌려놓는다
+    saved_title = ctypes.create_unicode_buffer(1024)
+    has_title = kernel32.GetConsoleTitleW(saved_title, len(saved_title)) > 0
+    monitor.live = True
+    monitor.tween.enabled = not USE_ASCII  # 옛 콘솔은 한 장 그리는 게 느려서 애니메이션이 오히려 버벅인다
 
     def on_break(*_):
         raise KeyboardInterrupt
@@ -1779,15 +1964,24 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
         if show_logo:
             # 로고를 띄운 사이 흐른 시간으로 첫 값을 낸다. 첫 화면이 '측정 중' 으로 비지 않는다
             show_splash(monitor)
+            monitor.tween.items.clear()  # 로고 뒤 첫 화면에서 막대가 0 부터 차오르게
             monitor.tick()
         size = term_size()
         draw(monitor.render(size.columns, size.lines), size.columns, size.lines)
+        signals = ""
 
         deadline = time.monotonic() + monitor.interval
         while True:
+            fresh = monitor.window_signals()
+            if fresh != signals:
+                signals = fresh
+                sys.stdout.write(fresh)
             # 키 검사를 먼저, 조건 없이 한다. 한 장 그리는 시간이 갱신 주기보다 길어지면
-            # 갱신 분기에만 걸려서 키가 영영 안 읽히기 때문이다
+            # 갱신 분기에만 걸려서 키가 영영 안 읽히기 때문이다.
+            # 막대가 미끄러지는 중이면 다음 장 그릴 때까지만 기다린다
             remaining = max(0.0, deadline - time.monotonic())
+            if monitor.tween.busy(time.monotonic()):
+                remaining = min(remaining, FRAME_SECONDS)
             if key_waiting(remaining):
                 quit_now = False
                 while msvcrt.kbhit():  # 밀린 키는 한 번에 다 처리한다
@@ -1814,8 +2008,10 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write(CURSOR_SHOW + ALT_SCREEN_OFF)
+        sys.stdout.write((TASKBAR_CLEAR if TASKBAR else "") + CURSOR_SHOW + ALT_SCREEN_OFF)
         sys.stdout.flush()
+        if has_title:
+            kernel32.SetConsoleTitleW(saved_title.value)
         restore_console_mode(saved_mode)
     return 0
 
@@ -1985,7 +2181,7 @@ def self_update(check_only: bool = False) -> int:
 
 
 def main():
-    global USE_ASCII
+    global USE_ASCII, TASKBAR
 
     parser = argparse.ArgumentParser(
         prog="wsc",
@@ -2034,6 +2230,7 @@ def main():
         monitor.start_version_check()
     if sys.stdout.isatty() and sys.stdin.isatty():
         USE_ASCII = args.ascii or (not args.unicode and wants_ascii())
+        TASKBAR = not os.environ.get("TERM_PROGRAM")
         return run_interactive(monitor, show_logo=not args.no_logo)
     USE_ASCII = not args.unicode  # 파일·파이프는 코드 페이지에 없는 막대 글자가 ? 로 깨진다
     return run_once(monitor)
