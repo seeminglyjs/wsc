@@ -12,6 +12,7 @@ import collections
 import ctypes
 import math
 import os
+import random
 import re
 import signal
 import struct
@@ -30,7 +31,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -109,6 +110,32 @@ GRAPH_FRAME_SECONDS = 1 / 15  # 그래프가 흘러가게 화면을 다시 그�
 # 측정값이 바뀌면 막대와 숫자를 툭 바꾸지 않고 이만큼(초)에 걸쳐 미끄러지게 옮긴다
 TWEEN_SECONDS = 0.45
 FRAME_SECONDS = 1 / 30  # 옮기는 동안 화면을 다시 그리는 간격
+
+# 값 급등 표시. 줄의 CPU 가 지난번보다 코어 몇 % 어치 넘게 뛰면 CPU% 칸이 번쩍였다가 식는다.
+# 기기 전체 % 로 재면 코어가 많은 기기에서는 늘 작게 뛰어서 코어 기준으로 본다 (50 = 코어 반 개)
+FLASH_JUMP = 50
+FLASH_SECONDS = 1.4
+FLASH_RGB = (255, 176, 32)  # 번쩍일 때 바탕색. 식으면서 점점 어두워진다
+
+# 종료시킨 줄이 사라지는 연출. 빨갛게 번쩍인 뒤 글자가 하나씩 부서져 흩어진다
+VANISH_FLASH = 0.12
+VANISH_SECONDS = 0.75
+VANISH_GLYPHS = "▓▒░·"
+VANISH_GLYPHS_ASCII = "#=-."
+KILL_REFRESH_DELAY = 0.15  # 종료시킨 뒤 목록을 다시 읽기까지 기다리는 초
+
+# 상세 창. 뒤 화면을 이 비율까지 어둡게 하고, 여는 동안 창이 가운데에서 좌우로 펼쳐진다
+DETAIL_DIM = 0.32
+DETAIL_SHADOW = 0.12  # 창 그림자 자리는 더 어둡게
+DETAIL_OPEN_SECONDS = 0.18
+DETAIL_MAX_BODY = 16  # 상세 창 본문 최대 줄 수. 묶은 줄의 프로세스 목록이 길어도 이만큼에서 끊는다
+DETAIL_BG = (28, 32, 40)
+DETAIL_BORDER = (88, 108, 138)
+DETAIL_TITLE = (125, 211, 252)
+DETAIL_LABEL = (128, 136, 150)
+DETAIL_TEXT = (226, 232, 240)
+DETAIL_DIM_TEXT = (100, 108, 122)
+DETAIL_KEY = (222, 226, 232)  # 조작 키 바탕
 # 전체 CPU 에서 프로세스 몫을 뺀 나머지가 이만큼(%p) 넘으면 CPU 줄에 띄운다. 평소에도
 # 인터럽트 처리 같은 게 몇 %p 는 남아서, 그보다 확실히 클 때만 보이게 한다
 UNLISTED_WARN = 10.0
@@ -154,6 +181,15 @@ LOGO_ASCII = (
 LOGO_COLORS = tuple(f"{ESC}[38;5;{c}m" for c in (87, 81, 75, 69, 105, 141))
 LOGO_SHADOW = f"{ESC}[38;5;60m"
 SPLASH_SECONDS = 1.0  # 시작 로고를 띄워 두는 시간. 그사이 첫 측정을 끝내 첫 화면부터 값이 나온다
+# 로고 '해독' 연출. 처음 이만큼(초)에 걸쳐 무작위 글자가 제 글자로 굳는다. 나머지 시간은 다 된 로고를 보여준다
+LOGO_DECODE_SECONDS = 0.65
+LOGO_NOISE = "▓▒░█▚▞▙▟▛▜"
+LOGO_NOISE_ASCII = "#%&@$*+=?"
+LOGO_NOISE_LEAD = 0.3  # 굳기 이만큼 전부터 무작위 글자로 깜빡이기 시작한다 (해독 진행 비율)
+LOGO_FLASH = 0.08  # 굳은 직후 하얗게 번쩍이는 동안 (해독 진행 비율)
+LOGO_NOISE_COLOR = f"{ESC}[38;2;64;150;170m"
+LOGO_FLASH_COLOR = f"{ESC}[38;2;235;250;255m"
+LOGO_JITTER = tuple(random.Random(7).random() for _ in range(97))  # 칸마다 굳는 때를 어긋나게 할 고정 난수
 
 # 옛 콘솔(conhost)을 한중일 코드 페이지로 쓰면 █ · … 같은 '폭이 애매한' 글자를
 # 두 칸으로 그려서 표가 통째로 어긋난다. 그럴 때 한 칸짜리 영문 기호로 바꿔 그린다
@@ -338,6 +374,10 @@ kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
 kernel32.TerminateProcess.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.restype = wintypes.BOOL
 iphlpapi.GetExtendedTcpTable.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
@@ -369,6 +409,8 @@ ERROR_ACCESS_DENIED = 5
 ERROR_INVALID_PARAMETER = 87
 ERROR_INSUFFICIENT_BUFFER = 122
 PROCESS_TERMINATE = 0x0001
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+FILETIME_UNIX_EPOCH = 116444736000000000  # 1601 년부터 1970 년까지를 100ns 로 센 값
 WM_CLOSE = 0x0010
 GW_OWNER = 4
 AF_INET, AF_INET6 = 2, 23
@@ -443,7 +485,7 @@ _proc_buf_size = 512 * 1024  # 지난번에 맞았던 크기를 기억해 두면
 
 
 def sample_processes() -> dict:
-    """{pid: (생성 시각, 누적 CPU 초, 개인 작업 집합, 작업 집합, 이름)} 스냅샷.
+    """{pid: (생성 시각, 누적 CPU 초, 개인 작업 집합, 작업 집합, 이름, 스레드 수, 핸들 수, 부모 PID)} 스냅샷.
 
     한 번 호출로 모든 프로세스가 나온다. 프로세스를 하나씩 여는 방식과 달리
     관리자 권한이 없어도 시스템·다른 사용자 프로세스까지 다 보인다.
@@ -467,6 +509,9 @@ def sample_processes() -> dict:
                 max(0, info.WorkingSetPrivateSize),
                 info.WorkingSetSize,
                 name,
+                info.NumberOfThreads,
+                info.HandleCount,
+                info.InheritedFromUniqueProcessId or 0,
             )
         if not info.NextEntryOffset:
             break
@@ -693,6 +738,24 @@ def close_windows(pid: int) -> int:
     if not sent and denied:
         raise PermissionError
     return sent
+
+
+def process_path(pid: int) -> str:
+    """실행 파일의 전체 경로. 시스템 프로세스처럼 열어 볼 권한이 없으면 빈 문자열.
+
+    '제한된 조회' 권한만 달라고 해서, 관리자 권한이 없어도 내 프로세스는 대부분 열린다.
+    """
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def terminate(pid: int) -> None:
@@ -968,15 +1031,260 @@ class Tween:
         )
 
 
-def logo_lines() -> tuple:
-    """색을 입힌 로고 줄 목록과 그 폭. 영문 기호 모드면 영문판을 쓴다."""
+# ── 화면 겹치기 (상세 창) ───────────────────────────────────────
+# 상세 창을 띄울 때 뒤 화면을 어둡게 다시 칠하고 그 위에 창을 얹는다. 색 코드가 섞인 줄을
+# 칸마다 (글자, 모양) 으로 풀어 놓아야 어느 칸이든 색을 바꾸거나 덮어쓸 수 있다.
+# 모양은 (글자색, 바탕색, 굵게) 이고 색은 (R, G, B) 또는 None(터미널 기본색) 이다
+SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+DEFAULT_FG = (204, 204, 204)  # 색을 안 준 글자를 어둡게 칠할 때 기준으로 삼는 색
+XTERM_BASE = (
+    (0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16), (36, 114, 200), (188, 63, 188),
+    (17, 168, 205), (229, 229, 229), (102, 102, 102), (241, 76, 76), (35, 209, 139),
+    (245, 245, 67), (59, 142, 234), (214, 112, 214), (41, 184, 219), (255, 255, 255),
+)
+
+
+def xterm_rgb(n: int) -> tuple:
+    """256색 번호를 RGB 로."""
+    if n < 16:
+        return XTERM_BASE[n]
+    if n < 232:
+        n -= 16
+        steps = (0, 95, 135, 175, 215, 255)
+        return steps[n // 36], steps[n // 6 % 6], steps[n % 6]
+    gray = 8 + 10 * (n - 232)
+    return gray, gray, gray
+
+
+def apply_sgr(style: tuple, params: str) -> tuple:
+    """색 코드 하나를 모양에 적용한다. wsc 가 쓰는 것만 알아듣는다."""
+    fg, bg, bold = style
+    codes = [int(c) if c else 0 for c in params.split(";")] if params else [0]
+    i = 0
+    while i < len(codes):
+        c = codes[i]
+        if c == 0:
+            fg, bg, bold = None, None, False
+        elif c == 1:
+            bold = True
+        elif c == 22:
+            bold = False
+        elif c == 2:
+            fg = tuple(round(v * 0.6) for v in (fg or DEFAULT_FG))  # 흐리게는 색을 낮춰 흉내 낸다
+        elif c in (38, 48) and i + 1 < len(codes):
+            if codes[i + 1] == 5 and i + 2 < len(codes):
+                color = xterm_rgb(codes[i + 2])
+                i += 2
+            elif codes[i + 1] == 2 and i + 4 < len(codes):
+                color = tuple(codes[i + 2:i + 5])
+                i += 4
+            else:
+                color = None
+            if c == 38:
+                fg = color
+            else:
+                bg = color
+        elif c == 39:
+            fg = None
+        elif c == 49:
+            bg = None
+        i += 1
+    return fg, bg, bold
+
+
+def to_cells(line: str, cols: int) -> list:
+    """색 코드가 섞인 줄을 cols 칸의 [글자, 모양] 목록으로. 두 칸 글자 뒤 칸은 글자가 '' 다."""
+    cells = []
+    style = (None, None, False)
+    pos = 0
+    while pos < len(line) and len(cells) < cols:
+        m = SGR_RE.match(line, pos)
+        if m:
+            style = apply_sgr(style, m.group(1))
+            pos = m.end()
+            continue
+        if line[pos] == "\x1b":  # 색이 아닌 제어 문자는 건너뛴다
+            m = ANSI_RE.match(line, pos)
+            pos = m.end() if m else pos + 1
+            continue
+        ch = line[pos]
+        pos += 1
+        w = dwidth(ch)
+        if w == 0:
+            continue
+        if len(cells) + w > cols:
+            break
+        cells.append([ch, style])
+        if w == 2:
+            cells.append(["", style])
+    while len(cells) < cols:
+        cells.append([" ", (None, None, False)])
+    return cells
+
+
+def sgr_of(style: tuple) -> str:
+    fg, bg, bold = style
+    parts = ["0"]
+    if bold:
+        parts.append("1")
+    if fg:
+        parts.append("38;2;%d;%d;%d" % fg)
+    if bg:
+        parts.append("48;2;%d;%d;%d" % bg)
+    return f"{ESC}[{';'.join(parts)}m"
+
+
+def from_cells(cells: list) -> str:
+    out, last = [], None
+    for ch, style in cells:
+        if ch == "":
+            continue
+        if style != last:
+            out.append(sgr_of(style))
+            last = style
+        out.append(ch)
+    out.append(RESET)
+    return "".join(out)
+
+
+def darken(style: tuple, factor: float) -> tuple:
+    fg, bg, bold = style
+    fg = tuple(round(v * factor) for v in (fg or DEFAULT_FG))
+    bg = tuple(round(v * factor) for v in bg) if bg else None
+    return fg, bg, bold
+
+
+def put_text(cells: list, col: int, text: str, style: tuple):
+    """cells 의 col 칸부터 text 를 덮어쓴다. 반쪽만 덮인 두 칸 글자는 빈칸으로 바꾼다."""
+    if 0 < col < len(cells) and cells[col][0] == "":
+        cells[col - 1][0] = " "
+    for ch in text:
+        w = dwidth(ch)
+        if w == 0:
+            continue
+        if col + w > len(cells):
+            break
+        cells[col] = [ch, style]
+        if w == 2:
+            cells[col + 1] = ["", style]
+        col += w
+    if col < len(cells) and cells[col][0] == "":
+        cells[col][0] = " "
+
+
+def mid_trunc(s: str, width: int) -> str:
+    """가운데를 … 로 줄인다. 경로는 앞(드라이브)과 끝(파일 이름)이 다 중요하다."""
+    if dwidth(s) <= width:
+        return s
+    if width < 5:
+        return dtrunc(s, width)
+    keep_tail = width // 2
+    tail, used = "", 0
+    for ch in reversed(s):
+        if used + dwidth(ch) > keep_tail:
+            break
+        tail = ch + tail
+        used += dwidth(ch)
+    return dtrunc(s, width - used) + tail  # 앞쪽은 늘 잘리므로 끝에 … 가 붙어 있다
+
+
+def ease_out(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return 1 - (1 - t) ** 3
+
+
+def vanish_line(text: str, age: float) -> str:
+    """종료시킨 줄이 사라지는 모습. age 는 사라지기 시작한 뒤 흐른 초.
+
+    처음 VANISH_FLASH 초는 줄 전체가 빨갛게 번쩍인다. 그 뒤로는 글자마다 정해진 때에
+    ▓▒░· 로 부서지다 빈칸이 된다. 왼쪽부터 무너지되 칸마다 조금씩 어긋나 흩어지듯 보인다
+    """
+    if age < VANISH_FLASH:
+        return f"{ESC}[48;2;200;45;45m{ESC}[38;2;255;255;255m{BOLD}{text}{RESET}"
+    p = (age - VANISH_FLASH) / (VANISH_SECONDS - VANISH_FLASH)
+    glyphs = VANISH_GLYPHS_ASCII if USE_ASCII else VANISH_GLYPHS
+    crumble = 0.18  # 한 글자가 부서지는 동안 (진행 비율)
+    out, last = [], ""
+    n = max(1, len(text.rstrip()))  # 이름 뒤 빈칸까지 세면 글자가 너무 일찍 다 부서진다
+    for i, ch in enumerate(text):
+        w = dwidth(ch)
+        if ch == " " or w == 0:
+            out.append(ch)
+            continue
+        at = 0.8 * (0.55 * i / n + 0.45 * LOGO_JITTER[(i * 37) % len(LOGO_JITTER)])
+        if p < at:
+            # 아직 남은 글자. 시간이 갈수록 붉은빛이 사그라진다
+            fade = p / at
+            color = rgb((255 - round(110 * fade), 110 - round(60 * fade), 110 - round(60 * fade)))
+            glyph = ch
+        elif p < at + crumble:
+            k = int((p - at) / crumble * len(glyphs))
+            color = rgb((190, 60, 50))
+            glyph = glyphs[min(k, len(glyphs) - 1)] * w  # 두 칸 글자 자리는 두 칸을 채워 폭을 지킨다
+        else:
+            out.append(" " * w)
+            continue
+        if color != last:
+            out.append(color)
+            last = color
+        out.append(glyph)
+    out.append(RESET)
+    return "".join(out)
+
+
+def human_age(seconds: float) -> str:
+    """얼마나 오래됐는지. 상세 창의 시작 시각 옆에 붙인다."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "방금"
+    if minutes < 60:
+        return f"{minutes}분 전"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}시간 {minutes}분 전"
+    days, hours = divmod(hours, 24)
+    return f"{days}일 {hours}시간 전"
+
+
+def filetime_local(ft: int):
+    """FILETIME(1601 년부터 100ns) 을 지역 시각(struct_time)으로. 0 이면 None."""
+    if ft <= FILETIME_UNIX_EPOCH:
+        return None
+    return time.localtime((ft - FILETIME_UNIX_EPOCH) / 1e7)
+
+
+def logo_lines(reveal: float = 1.0) -> tuple:
+    """색을 입힌 로고 줄 목록과 그 폭. 영문 기호 모드면 영문판을 쓴다.
+
+    reveal 이 1 보다 작으면 '해독' 중인 모습을 그린다. 왼쪽부터 무작위 글자가 번갈아 깜빡이다가
+    제 글자로 굳고, 굳는 순간 하얗게 번쩍인다. 부를 때마다 무작위 글자가 바뀌어 깜빡임이 된다
+    """
     glyphs = LOGO_ASCII if USE_ASCII else LOGO
     rows = [" ".join(letter[i] for letter in glyphs) for i in range(len(glyphs[0]))]
     width = max(len(row) for row in rows)
+    noise = LOGO_NOISE_ASCII if USE_ASCII else LOGO_NOISE
     out = []
-    for row in rows:
+    for r, row in enumerate(rows):
         parts, last = [], ""
         for col, ch in enumerate(row):
+            if ch != " " and reveal < 1.0:
+                # 이 칸이 굳는 때. 왼쪽일수록 이르고, 칸마다 조금씩 어긋나 물결처럼 번진다
+                at = 0.7 * col / width + 0.3 * LOGO_JITTER[(r * 131 + col) % len(LOGO_JITTER)]
+                if reveal < at - LOGO_NOISE_LEAD:
+                    ch = " "
+                elif reveal < at:
+                    ch = random.choice(noise)
+                    color = LOGO_NOISE_COLOR
+                elif reveal < at + LOGO_FLASH:
+                    color = LOGO_FLASH_COLOR
+                else:
+                    at = None
+                if at is not None and ch != " ":
+                    if color != last:
+                        parts.append(color)
+                        last = color
+                    parts.append(ch)
+                    continue
             if ch != " ":
                 if ch == "█" or USE_ASCII:
                     color = LOGO_COLORS[col * len(LOGO_COLORS) // width]
@@ -1071,9 +1379,18 @@ class Monitor:
         self.scroll = 0
         self.visible_rows = 1
         self.ports = {}  # {PID: [포트, ...]}
+        self.procs = {}  # 마지막으로 읽은 sample_processes() 결과
         self.pending_kill = None  # 종료 확인을 기다리는 (PID, 이름, 생성 시각)
         self.status = ("", "", 0.0)  # (문구, 색, 띄운 시각)
         self.needs_refresh = False
+        # 연출용 상태
+        self.detail_at = None  # 상세 창을 연 시각. None 이면 닫혀 있다
+        self.prev_key_pct = None  # 지난번 줄마다의 CPU%. 확 뛴 줄을 찾는다
+        self.flashes = {}  # {줄 키: 번쩍이기 시작한 시각}
+        self.last_table = {}  # {줄 키: (표 안 순서, 굴림 위치, 글자만 남긴 줄)} 지난번에 그린 표
+        self.kill_watch = None  # 종료시킨 프로세스가 사라지는지 지켜본다. (PID, 생성 시각, 줄 키, 그만 볼 시각)
+        self.vanish = None  # 사라지는 줄. (표 안 순서, 굴림 위치, 글자만 남긴 줄, 시작 시각)
+        self._path_cache = (None, "")  # ((PID, 생성 시각), 실행 파일 경로)
 
     def start_version_check(self):
         """새 버전 확인을 뒷전으로 돌린다. 화면이 뜨는 걸 막지 않게 하려는 것."""
@@ -1130,7 +1447,7 @@ class Monitor:
         rows = []
         compressed = 0
         elapsed = now - self.prev_t if self.prev_t else 0.0
-        for pid, (born, cpu_s, private, ws, name) in procs.items():
+        for pid, (born, cpu_s, private, ws, name, *_) in procs.items():
             pct = 0.0
             before = self.prev.get(pid)
             # 윈도우는 PID 를 금방 다시 쓴다. 생성 시각까지 같아야 같은 프로세스다
@@ -1163,8 +1480,33 @@ class Monitor:
 
         self.compressed = compressed
         self.rows = rows
+        self.procs = procs  # 상세 창이 스레드·부모·시작 시각을 꺼내 쓴다
         self.prev = {pid: (p[0], p[1]) for pid, p in procs.items()}
         self.prev_t = now
+
+        # 프로세스 CPU 가 확 뛴 줄은 CPU% 칸을 잠깐 번쩍였다가 식힌다. 시세판처럼 눈이 그리로 간다.
+        # 첫 측정 직후는 모두 0 에서 뛴 것처럼 보여서 건너뛴다
+        if elapsed > 0:
+            current = {r[0]: r[1] for r in self.sorted_rows()}
+            if self.prev_key_pct is not None:
+                for key, pct in current.items():
+                    before = self.prev_key_pct.get(key)
+                    if before is not None and (pct - before) * NCPU >= FLASH_JUMP:
+                        self.flashes[key] = now
+            self.prev_key_pct = current
+        self.flashes = {k: t for k, t in self.flashes.items() if now - t < FLASH_SECONDS}
+
+        # 종료시킨 프로세스가 목록에서 사라졌으면 그 줄이 흩어지며 사라지는 연출을 건다
+        if self.kill_watch:
+            pid, born, key, until = self.kill_watch
+            info = procs.get(pid)
+            if info is None or info[0] != born:
+                self.kill_watch = None
+                seen = self.last_table.get(key)
+                if seen:
+                    self.vanish = (*seen, now)
+            elif now > until:
+                self.kill_watch = None
 
         # 화면 값이 따라갈 목표를 새로 건다
         tw = self.tween
@@ -1309,6 +1651,10 @@ class Monitor:
         else:
             self.set_status(f"{who} — {how}", GREEN)
             self.needs_refresh = True
+            # 목록에서 사라지는 걸 보면 그 줄이 흩어지며 사라지게 그린다. 창 닫기는 저장 여부를
+            # 묻느라 늦게 끝날 수 있어 몇 초 지켜본다
+            row_key = name if self.grouped else pid
+            self.kill_watch = (pid, born, row_key, time.monotonic() + 5.0)
 
     def window_signals(self) -> str:
         """창 제목과 작업 표시줄 아이콘에 띄울 제어 문자. 측정값이 바뀔 때만 다시 보낸다.
@@ -1328,7 +1674,199 @@ class Monitor:
             out += f"{ESC}]9;4;{state};{max(1, round(self.total_cpu))}{BEL}"
         return out
 
+    def frame_wait(self, now: float):
+        """연출 중이면 다음 장까지 기다릴 초. 움직이는 게 없으면 None (다음 갱신까지 쉰다)."""
+        if (
+            self.tween.busy(now)
+            or self.vanish
+            or (self.detail_at is not None and now - self.detail_at < DETAIL_OPEN_SECONDS)
+            or any(now - t < FLASH_SECONDS for t in self.flashes.values())
+        ):
+            return FRAME_SECONDS
+        # 그래프는 늘 조금씩 흐른다. 상세 창 뒤에 깔려 어두울 때는 멈춰 둔다
+        if self.graph_h and self.detail_at is None:
+            return GRAPH_FRAME_SECONDS
+        return None
+
+    def open_detail(self):
+        if self.selected is None:
+            self.move_selection(0)  # 고른 줄이 없으면 맨 위 줄을 고른다
+            if self.selected is None:
+                return
+        self.detail_at = time.monotonic()
+
+    def detail_path(self, pid: int) -> str:
+        """상세 창에 적을 실행 파일 경로. 창을 그릴 때마다 묻지 않게 PID·생성 시각으로 기억한다."""
+        info = self.procs.get(pid)
+        cache_key = (pid, info[0] if info else None)
+        if self._path_cache[0] != cache_key:
+            self._path_cache = (cache_key, process_path(pid))
+        return self._path_cache[1]
+
+    def detail_rows(self, row: tuple, inner_w: int, room: int) -> tuple:
+        """상세 창의 (제목, 오른쪽 제목, 본문 줄 목록). 본문 한 줄은 [(글자, 글자색, 굵게)] 다.
+
+        room 은 본문에 쓸 수 있는 줄 수다. 묶은 줄의 프로세스 목록은 이 안에 들어가는 만큼만 적는다.
+        """
+        key, pct, private, name, count, ports, pid = row
+        label_w = 8
+        value_w = inner_w - label_w
+        now_wall = time.time()
+
+        def field(label, value, note=""):
+            value = dtrunc(value, value_w)
+            parts = [(dpad(label, label_w), DETAIL_LABEL, False), (value, DETAIL_TEXT, False)]
+            if note and dwidth(value) + 2 + dwidth(note) <= value_w:
+                parts.append(("  " + note, DETAIL_DIM_TEXT, False))
+            return parts
+
+        def started(born):
+            at = filetime_local(born)
+            if at is None:
+                return "알 수 없음", ""
+            today = time.localtime(now_wall)[:3] == at[:3]
+            stamp = time.strftime("오늘 %H:%M:%S" if today else "%m월 %d일 %H:%M", at)
+            return stamp, human_age(now_wall - time.mktime(at))
+
+        port_text = "  ".join(f":{p}" for p in ports) if ports else ""
+        members = [r for r in self.rows if (r[3] == name if self.grouped else r[0] == pid)]
+        sort_idx = 1 if self.sort_key == "cpu" else 2
+        members.sort(key=lambda r: r[sort_idx], reverse=True)
+        lead = members[0][0] if members else pid
+        path = self.detail_path(lead) or "알 수 없음 (열어 볼 권한 없음)"
+        body = [field("경로", mid_trunc(path, value_w))]
+
+        if count <= 1:
+            info = self.procs.get(pid)
+            born, _, _, ws, _, threads, handles, parent = info if info else (0,) * 8
+            stamp, age = started(born)
+            body.append(field("시작", stamp, age))
+            body.append(field("CPU", f"{pct:.1f}%", f"코어 하나의 {pct * NCPU:.0f}%"))
+            body.append(field("메모리", human_bytes(private), f"작업 집합 {human_bytes(ws)}"))
+            body.append(field("스레드", f"{threads:,}", f"핸들 {handles:,}"))
+            # 부모가 먼저 끝나면 그 PID 를 딴 프로세스가 물려받을 수 있다. 자식보다 늦게 생긴 건 부모가 아니다
+            dad = self.procs.get(parent)
+            if parent and dad and dad[0] <= born:
+                body.append(field("부모", dad[4], f"PID {parent}"))
+            elif parent:
+                body.append(field("부모", "이미 끝남", f"PID {parent}"))
+            body.append(field("포트", port_text or "없음"))
+            return name, f"PID {pid}", body
+
+        threads = sum(self.procs.get(r[0], (0,) * 8)[5] for r in members)
+        body.append(field("합계", f"CPU {pct:.1f}%  메모리 {human_bytes(private)}", f"스레드 {threads:,}"))
+        body.append(field("포트", port_text or "없음"))
+        body.append([])
+        body.append([(f"{'PID':>7}  {'CPU%':>6}  {rpad('메모리', 8)}  시작", DETAIL_LABEL, False)])
+        # 남은 줄에 들어가는 만큼만. 넘치면 마지막 줄을 '외 N개' 로 쓴다
+        fit = max(1, room - len(body))
+        shown = members if len(members) <= fit else members[:fit - 1]
+        for m_pid, m_pct, m_private, _ in shown:
+            stamp, age = started(self.procs.get(m_pid, (0,))[0])
+            body.append([
+                (f"{m_pid:>7}  {m_pct:>6.1f}  {human_bytes(m_private):>8}  ", DETAIL_TEXT, False),
+                (dtrunc(f"{stamp}  {age}", max(1, inner_w - 29)), DETAIL_DIM_TEXT, False),
+            ])
+        if len(shown) < len(members):
+            body.append([(f"{'':>7}  외 {len(members) - len(shown)}개", DETAIL_DIM_TEXT, False)])
+        return f"{name} ×{count}", f"프로세스 {count}개", body
+
+    def overlay_detail(self, out: list, cols: int, lines: int) -> list:
+        """상세 창을 화면 위에 얹는다. 뒤 화면은 어둡게 다시 칠하고 창 오른쪽·아래에 그림자를 깐다.
+
+        여는 동안(DETAIL_OPEN_SECONDS) 뒤 화면이 서서히 어두워지고 창이 가운데에서 좌우로 펼쳐진다.
+        """
+        row = next((r for r in self.sorted_rows() if r[0] == self.selected), None)
+        if row is None:
+            self.detail_at = None
+            self.set_status("프로세스가 끝나서 상세 창을 닫음", GRAY)
+            return out
+        grow = ease_out((time.monotonic() - self.detail_at) / DETAIL_OPEN_SECONDS)
+
+        box_w = max(30, min(cols - 4, 80))
+        inner_w = box_w - 4  # 양쪽 테두리와 한 칸씩 띄운 자리
+        # 위아래 테두리, 본문 뒤 빈 줄과 조작 줄을 뺀 자리. 창이 화면을 다 덮으면 뒤가 안 보여 모달 같지 않다
+        room = max(3, min(DETAIL_MAX_BODY, lines - 2 - 4 - 4))
+        title, right_title, body = self.detail_rows(row, inner_w, room)
+        body = body[:room]
+        keys = [("Esc", "닫기"), ("↑↓", "다른 줄")]
+        keys.append(("g", "하나씩 보기") if row[4] > 1 else ("k", "종료"))
+        footer = []
+        for k, label in keys:
+            footer.append((f" {k} ", (24, 24, 28), True, DETAIL_KEY))
+            footer.append((f" {label}   ", DETAIL_LABEL, False, None))
+        rows_out = [None] + body + [[], footer] + [None]  # None 은 위아래 테두리
+        box_h = len(rows_out)
+
+        # 뒤 화면을 칸으로 풀어 어둡게 칠한다
+        grid = [to_cells(line, cols) for line in out[:lines]]
+        while len(grid) < lines:
+            grid.append(to_cells("", cols))
+        dim = 1 - (1 - DETAIL_DIM) * grow
+        for cells in grid:
+            for cell in cells:
+                cell[1] = darken(cell[1], dim)
+
+        # 펼쳐지는 동안의 폭. 가운데를 기준으로 좌우가 같이 늘어난다
+        cur_w = max(8, round(box_w * (0.4 + 0.6 * grow)))
+        cur_inner = cur_w - 4
+        top = max(0, (lines - box_h) // 2)
+        left = max(0, (cols - cur_w) // 2)
+
+        # 그림자. 오른쪽으로 두 칸, 아래로 한 줄. 칸은 세로로 길어서 두 칸이라야 두께가 맞아 보인다
+        shade = DETAIL_SHADOW / DETAIL_DIM
+        for r in range(top + 1, min(lines, top + box_h + 1)):
+            span = range(left + cur_w, left + cur_w + 2) if r < top + box_h else range(left + 2, left + cur_w + 2)
+            for c in span:
+                if c < cols:
+                    grid[r][c][1] = darken(grid[r][c][1], shade)
+
+        ascii_box = USE_ASCII
+        h, v = ("-", "|") if ascii_box else ("─", "│")
+        corners = ("+", "+", "+", "+") if ascii_box else ("╭", "╮", "╰", "╯")
+        border = (DETAIL_BORDER, DETAIL_BG, False)
+        fill = (DETAIL_TEXT, DETAIL_BG, False)
+        for i, parts in enumerate(rows_out):
+            r = top + i
+            if r >= lines:
+                break
+            cells = grid[r]
+            if parts is None:
+                first = i == 0
+                put_text(cells, left, (corners[0] if first else corners[2]) + h * (cur_w - 2)
+                         + (corners[1] if first else corners[3]), border)
+                if first and cur_inner > 8:
+                    # 위 테두리에 제목을 박는다. 왼쪽은 이름, 오른쪽은 PID·개수
+                    name = dtrunc(title, max(4, cur_inner - dwidth(right_title) - 4))
+                    put_text(cells, left + 2, f" {name} ", (DETAIL_TITLE, DETAIL_BG, True))
+                    if dwidth(name) + dwidth(right_title) + 6 <= cur_inner:
+                        put_text(cells, left + cur_w - 3 - dwidth(right_title),
+                                 f" {right_title} ", (DETAIL_LABEL, DETAIL_BG, False))
+                continue
+            put_text(cells, left, v, border)
+            put_text(cells, left + 1, " " * (cur_w - 2), fill)
+            put_text(cells, left + cur_w - 1, v, border)
+            col, room_w = left + 2, cur_inner
+            for part in parts:
+                if room_w <= 0:
+                    break
+                text, fg, bold = part[:3]
+                bg = part[3] if len(part) > 3 and part[3] else DETAIL_BG
+                text = dtrunc(text, room_w) if dwidth(text) > room_w else text
+                if not text:
+                    break
+                put_text(cells, col, text, (fg, bg, bold))
+                col += dwidth(text)
+                room_w -= dwidth(text)
+        return [from_cells(cells) for cells in grid]
+
     def render(self, cols: int, lines: int) -> list:
+        out = self.render_main(cols, lines)
+        if self.detail_at is not None:
+            out = self.overlay_detail(out, max(52, cols), lines)
+        return out
+
+    def render_main(self, cols: int, lines: int) -> list:
         cols = max(52, cols)
         mem = self.mem
         page_used, page_total = self.pagefile
@@ -1594,7 +2132,19 @@ class Monitor:
         rows = self.sorted_rows()
         # 고른 줄이 목록 밖으로 나가지 않게 굴림 위치를 다듬는다
         self.scroll = max(0, min(self.scroll, max(0, len(rows) - limit)))
-        window = rows[self.scroll : self.scroll + limit]
+        # 종료시킨 줄이 흩어지는 중이면 그 자리를 비워 두고 거기에 연출을 그린다.
+        # 다 흩어지면 비운 자리가 없어지면서 아래 줄들이 한 칸씩 올라와 메운다
+        vanish = None
+        if self.vanish:
+            v_idx, v_scroll, v_text, v_at = self.vanish
+            if now - v_at >= VANISH_SECONDS:
+                self.vanish = None
+            elif v_scroll == self.scroll and v_idx < limit:
+                vanish = (v_idx, v_text, now - v_at)
+        window = rows[self.scroll : self.scroll + limit - (1 if vanish else 0)]
+        entries = list(window)
+        if vanish:
+            entries.insert(min(vanish[0], len(entries)), None)
 
         # 몇 번째를 보고 있는지 알리는 꼬리표. 마지막 줄에 그냥 붙이면 줄이 창 폭을
         # 넘어 다음 줄로 접히고, 그만큼 화면이 밀려 올라간다. 그래서 그 줄만
@@ -1604,38 +2154,49 @@ class Monitor:
             shown = f"{self.scroll + 1}–{min(self.scroll + limit, len(rows))}"
             count_note = f" {shown}/{len(rows)}"
 
-        for idx, (key, pct, private, name, count, ports, pid) in enumerate(window):
-            last_row = idx == len(window) - 1
+        table = {}
+        for idx, entry in enumerate(entries):
+            last_row = idx == len(entries) - 1
+            note = f"{GRAY}{count_note}{RESET}" if last_row and count_note else ""
+            if entry is None:
+                out.append(vanish_line(vanish[1], vanish[2]) + note)
+                continue
+            key, pct, private, name, count, ports, pid = entry
             col_w = max(6, name_w - dwidth(count_note)) if last_row else name_w
             chosen = key == self.selected
             port_text = format_ports(ports) if port_w else ""
             name_cell = dpad(name, col_w)
             # 여럿 묶인 줄은 PID 자리에 몇 개를 합쳤는지 적는다. 하나뿐이면 그 PID 를 그대로 둔다
             first = f"×{count}" if count > 1 else str(pid)
+            port_plain = f"{dpad(port_text, port_w)}  " if port_w else ""
+            body = f"{first:>7}  {pct:>7.1f}  {human_bytes(private):>8}  {port_plain}{name_cell}"
+            # 글자만 남긴 줄을 기억해 둔다. 이 줄을 종료시키면 이걸 부숴 가며 사라지게 그린다
+            table[key] = (idx, self.scroll, f" {body}")
             if chosen:
                 # 고른 줄은 색을 다 빼고 흰 글씨 하나로. 파란 바탕 위 색 글자는 안 읽힌다
-                port_cell = f"{dpad(port_text, port_w)}  " if port_w else ""
-                body = (
-                    f"›{first:>7}  {pct:>7.1f}  {human_bytes(private):>8}  "
-                    f"{port_cell}{name_cell}"
-                )
-                line = f"{SELECT_BG}{BOLD}{body}{RESET}"
+                line = f"{SELECT_BG}{BOLD}›{body}{RESET}"
             else:
                 port_cell = ""
                 if port_w:
                     port_color = CYAN if port_text else DIM
                     port_cell = f"{port_color}{dpad(port_text, port_w)}{RESET}  "
                 mem_color = proc_mem_color(private, mem["total"])
-                # 하나뿐인 묶음은 흐리게. 여러 개 합친 줄이 눈에 걸리게 한다
                 first_color = CYAN if count > 1 else ""  # 합친 줄이 눈에 걸리게
+                cpu_cell = f"  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
+                flash_at = self.flashes.get(key)
+                if flash_at is not None and now - flash_at < FLASH_SECONDS:
+                    # 바탕을 밝혔다가 식힌다. 밝을 땐 글자를 검게 해야 읽힌다. 칸 앞뒤 한 칸씩 같이 칠한다
+                    heat = (1 - (now - flash_at) / FLASH_SECONDS) ** 1.6
+                    bg = ";".join(str(round(c * heat)) for c in FLASH_RGB)
+                    fg = f"{ESC}[38;2;20;20;20m" if heat > 0.45 else proc_cpu_color(pct)
+                    cpu_cell = f" {ESC}[48;2;{bg}m{fg}{BOLD} {pct:>7.1f} {RESET} "
                 line = (
-                    f" {first_color}{first:>7}{RESET}  {proc_cpu_color(pct)}{pct:>7.1f}{RESET}  "
+                    f" {first_color}{first:>7}{RESET}{cpu_cell}"
                     f"{mem_color}{human_bytes(private):>8}{RESET}  "
                     f"{port_cell}{dim_ext(name_cell)}"
                 )
-            if last_row and count_note:
-                line += f"{GRAY}{count_note}{RESET}"
-            out.append(line)
+            out.append(line + note)
+        self.last_table = table
 
         # 알림 줄. 없으면 빈 줄로 남겨 아래 도움말 위치가 흔들리지 않게 한다
         text, color, shown_at = self.status
@@ -1666,6 +2227,7 @@ class Monitor:
         # (키, 긴 설명, 짧은 설명, 설명 없이도 뜻이 통하는가, 지금 켜져 있는가)
         keys = [
             ("↑↓", "고르기", "선택", True, False),
+            ("Enter", "자세히", "상세", False, False),
             ("k", "종료시키기", "종료", False, False),
             ("c", "CPU순", "CPU", False, self.sort_key == "cpu"),
             ("m", "메모리순", "메모리", False, self.sort_key == "mem"),
@@ -1735,8 +2297,25 @@ class Monitor:
                 self.set_status(f"{name} (PID {pid}) 종료 취소", GRAY)
             return True
 
+        # 상세 창이 떠 있으면 닫기·종료·줄 옮기기만 받는다. q 는 나가지 않고 창만 닫는다.
+        # 줄을 옮기면 창은 새로 고른 줄을 따라간다
+        moves = ("UP", "DOWN", "PGUP", "PGDN", "HOME", "END")
+        if self.detail_at is not None and key not in moves:
+            if key in ("\x03", "\x04"):
+                return False
+            if key in ("ESC", "\r", "q", "Q"):
+                self.detail_at = None
+            elif key in ("k", "K"):
+                self.detail_at = None
+                self.request_kill()
+            elif key in ("g", "G"):
+                self.toggle_group()
+            return True
+
         if key in ("q", "Q", "\x03", "\x04"):
             return False
+        if key == "\r":
+            self.open_detail()
         if key == "UP":
             self.move_selection(-1)
         elif key == "DOWN":
@@ -1909,8 +2488,12 @@ def draw(lines_out, cols: int, rows: int):
 
 
 def render_splash(monitor: Monitor, cols: int, rows: int, progress: float) -> list:
-    """시작 화면. 로고 아래에 기기 이름과 첫 측정이 얼마나 됐는지를 띄운다."""
-    logo, logo_w = logo_lines()
+    """시작 화면. 로고 아래에 기기 이름과 첫 측정이 얼마나 됐는지를 띄운다.
+
+    로고는 처음 LOGO_DECODE_SECONDS 동안 무작위 글자에서 제 글자로 '해독' 되며 나타난다.
+    """
+    elapsed = progress * SPLASH_SECONDS
+    logo, logo_w = logo_lines(elapsed / LOGO_DECODE_SECONDS)
     left = " " * max(1, (cols - logo_w) // 2)
     specs = f"{CPU_BRAND} · {NCPU}코어 · 메모리 {human_bytes(monitor.mem['total'])}"
     body = [
@@ -1939,7 +2522,7 @@ def show_splash(monitor: Monitor):
         progress = min(1.0, (time.monotonic() - start) / SPLASH_SECONDS)
         size = term_size()
         draw(render_splash(monitor, size.columns, size.lines, progress), size.columns, size.lines)
-        if progress >= 1.0 or key_waiting(0.04):
+        if progress >= 1.0 or key_waiting(FRAME_SECONDS):
             return
 
 
@@ -1994,6 +2577,7 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
         size = term_size()
         draw(monitor.render(size.columns, size.lines), size.columns, size.lines)
         signals = ""
+        refresh_at = 0.0  # 종료시킨 직후 한 번 더 읽을 시각
 
         deadline = time.monotonic() + monitor.interval
         while True:
@@ -2003,13 +2587,14 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
                 sys.stdout.write(fresh)
             # 키 검사를 먼저, 조건 없이 한다. 한 장 그리는 시간이 갱신 주기보다 길어지면
             # 갱신 분기에만 걸려서 키가 영영 안 읽히기 때문이다.
-            # 막대가 미끄러지는 중이면 다음 장 그릴 때까지만 기다린다
-            remaining = max(0.0, deadline - time.monotonic())
-            # 그래프가 떠 있으면 늘 조금씩 흘러가게 그린다
-            if monitor.tween.busy(time.monotonic()):
-                remaining = min(remaining, FRAME_SECONDS)
-            elif monitor.graph_h:
-                remaining = min(remaining, GRAPH_FRAME_SECONDS)
+            # 막대가 미끄러지거나 그래프가 흐르는 등 연출 중이면 다음 장 그릴 때까지만 기다린다
+            now = time.monotonic()
+            remaining = max(0.0, deadline - now)
+            frame = monitor.frame_wait(now)
+            if frame is not None:
+                remaining = min(remaining, frame)
+            if refresh_at:
+                remaining = min(remaining, max(0.0, refresh_at - now))
             if key_waiting(remaining):
                 quit_now = False
                 while msvcrt.kbhit():  # 밀린 키는 한 번에 다 처리한다
@@ -2022,8 +2607,12 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
                 deadline = min(deadline, time.monotonic() + monitor.interval)
 
             if monitor.needs_refresh:
-                # 프로세스를 종료시킨 직후. 목록에서 바로 빠지게 즉시 다시 읽는다
+                # 프로세스를 종료시킨 직후. 목록에서 바로 빠지게 곧 다시 읽는다. 강제 종료도
+                # 프로세스가 실제로 끝나기까지 잠깐 걸려서, 바로 읽으면 아직 목록에 남아 있다
                 monitor.needs_refresh = False
+                refresh_at = time.monotonic() + KILL_REFRESH_DELAY
+            if refresh_at and time.monotonic() >= refresh_at:
+                refresh_at = 0.0
                 monitor.tick()
                 deadline = time.monotonic() + monitor.interval
 
