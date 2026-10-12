@@ -21,6 +21,7 @@ import tempfile
 import time
 import threading
 import unicodedata
+import uuid
 import urllib.error
 import urllib.request
 
@@ -31,7 +32,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -220,6 +221,16 @@ USE_ASCII = False
 # 작업 표시줄 아이콘에 CPU 막대를 띄우는가. Windows Terminal 이 알아듣는 OSC 9;4 를 쓴다.
 # 다른 터미널 몇몇(WezTerm 등)은 OSC 9 를 알림 띄우기로 써서, 자기 이름을 밝힌 터미널에는 안 보낸다
 TASKBAR = False
+# 작업 표시줄 아이콘 모서리에 붙이는 배지 색. CPU 가 노랑·빨강 기준을 넘으면 붙이고 내려오면 뗀다
+BADGE_COLORS = {1: (245, 158, 11), 2: (239, 68, 68)}
+BADGE_TEXT = {1: "CPU 높음", 2: "CPU 과부하"}  # 화면 읽기 프로그램이 읽어 주는 배지 설명
+BADGE_SIZE = 32  # 배지 그림 크기(px). 작업 표시줄이 화면 배율에 맞춰 줄여 그린다
+# CPU 가 노랑 기준(60%)을 넘은 채 이만큼(초) 이어지면 작업 표시줄 버튼을 깜빡여 알린다.
+# 그 뒤로도 계속 넘어 있으면 OVERLOAD_REPEAT 마다 다시 알린다. 잠깐 내려왔다 다시 오르는 건
+# 같은 과부하로 친다. OVERLOAD_GRACE 넘게 내려가 있어야 끝난 것으로 본다
+OVERLOAD_AFTER = 180.0
+OVERLOAD_REPEAT = 600.0
+OVERLOAD_GRACE = 10.0
 
 
 # ── 문자열 폭 계산 (한글·CJK 는 두 칸 차지) ────────────────────
@@ -263,6 +274,8 @@ ntdll = ctypes.WinDLL("ntdll")
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 iphlpapi = ctypes.WinDLL("iphlpapi")
+gdi32 = ctypes.WinDLL("gdi32")
+ole32 = ctypes.WinDLL("ole32")
 
 
 class UNICODE_STRING(ctypes.Structure):
@@ -418,6 +431,72 @@ user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetWindow.restype = wintypes.HWND
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostMessageW.restype = wintypes.BOOL
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+class FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD),
+        ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
+gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD
+]
+gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+gdi32.CreateBitmap.restype = wintypes.HBITMAP
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteObject.restype = wintypes.BOOL
+user32.CreateIconIndirect.argtypes = [ctypes.POINTER(ICONINFO)]
+user32.CreateIconIndirect.restype = wintypes.HICON
+user32.DestroyIcon.argtypes = [wintypes.HICON]
+user32.DestroyIcon.restype = wintypes.BOOL
+user32.FlashWindowEx.argtypes = [ctypes.POINTER(FLASHWINFO)]
+user32.FlashWindowEx.restype = wintypes.BOOL
+ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+ole32.CoInitialize.restype = ctypes.c_long
+ole32.CoCreateInstance.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+]
+ole32.CoCreateInstance.restype = ctypes.c_long
+# ITaskbarList3 의 함수들. COM 객체는 첫 칸에 함수 주소 표를 들고 있어서 몇 번째 자리인지로 부른다
+COM_RELEASE = (2, ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p))
+TASKBAR_HR_INIT = (3, ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p))
+TASKBAR_SET_OVERLAY = (
+    18, ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, wintypes.HICON, wintypes.LPCWSTR)
+)
 
 STATUS_INFO_LENGTH_MISMATCH = ctypes.c_long(0xC0000004).value
 SYSTEM_PROCESS_INFO = 5
@@ -431,6 +510,13 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 FILETIME_UNIX_EPOCH = 116444736000000000  # 1601 년부터 1970 년까지를 100ns 로 센 값
 WM_CLOSE = 0x0010
 GW_OWNER = 4
+GA_ROOTOWNER = 3
+FLASHW_STOP = 0
+FLASHW_TRAY = 0x2
+FLASHW_TIMERNOFG = 0xC  # 창이 앞으로 나올 때까지 계속 깜빡인다
+CLSCTX_INPROC_SERVER = 0x1
+CLSID_TASKBAR_LIST = "56FDF344-FD6D-11D0-958A-006097C9A090"
+IID_TASKBAR_LIST3 = "EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF"
 AF_INET, AF_INET6 = 2, 23
 TCP_TABLE_OWNER_PID_LISTENER = 3
 # MIB_IF_ROW2 한 줄의 크기와, 쓰는 칸의 위치(바이트). 구조가 커서 필요한 칸만 꺼내 읽는다
@@ -839,11 +925,16 @@ def log_frac(rate: float, link: float) -> float:
 
 
 def level_color(frac: float) -> str:
+    return (GREEN, YELLOW, RED)[load_level(frac)]
+
+
+def load_level(frac: float) -> int:
+    """0 보통, 1 노랑(60% 이상), 2 빨강(85% 이상)."""
     if frac >= 0.85:
-        return RED
+        return 2
     if frac >= 0.60:
-        return YELLOW
-    return GREEN
+        return 1
+    return 0
 
 
 def proc_cpu_color(pct: float) -> str:
@@ -1452,6 +1543,11 @@ class Monitor:
         self.locked_at = 0.0  # 잠근 시각. 테두리가 잠기는 연출에 쓴다
         self.row_text = {}  # {표 안 순서: 글자만 남긴 줄} 지난번에 그린 것. 바뀐 글자를 찾는다
         self.decoding = {}  # {표 안 순서: (바꿀 칸 목록, 시작 시각)} 해독되며 바뀌는 줄
+        # CPU 과부하 알림
+        self.overload_since = None  # CPU 가 노랑 기준을 넘기 시작한 시각. 과부하가 아니면 None
+        self.calm_since = None  # 과부하 중에 기준 아래로 내려온 시각
+        self.alarm_at = None  # 이번 과부하에서 마지막으로 알린 시각
+        self.alarm_due = False  # 작업 표시줄 버튼을 깜빡일 차례. 대화형 화면이 받아서 깜빡인다
 
     def start_version_check(self):
         """새 버전 확인을 뒷전으로 돌린다. 화면이 뜨는 걸 막지 않게 하려는 것."""
@@ -1493,6 +1589,7 @@ class Monitor:
                 self.cpu_hist.append(self.total_cpu)
                 self.cpu_hist_at.append(now)
                 self.ready = True
+                self.watch_overload(now)
         self.prev_times = times
 
         # 코어별 사용률. 전체 CPU 가 낮아도 코어 하나가 꽉 차 있으면 그 프로그램은 느리다
@@ -1735,6 +1832,26 @@ class Monitor:
             row_key = name if self.grouped else pid
             self.kill_watch = (pid, born, row_key, time.monotonic() + 5.0)
 
+    def watch_overload(self, now: float):
+        """CPU 가 노랑 기준을 넘은 채 OVERLOAD_AFTER 초 이어지면 알린다. 그 뒤로도 이어지면
+        OVERLOAD_REPEAT 초마다 다시 알린다."""
+        if load_level(self.total_cpu / 100.0) == 0:
+            if self.overload_since is not None:
+                self.calm_since = self.calm_since or now
+                if now - self.calm_since >= OVERLOAD_GRACE:
+                    self.overload_since = self.calm_since = self.alarm_at = None
+            return
+        self.calm_since = None
+        if self.overload_since is None:
+            self.overload_since = now
+        lasted = now - self.overload_since
+        if lasted < OVERLOAD_AFTER:
+            return
+        if self.alarm_at is None or now - self.alarm_at >= OVERLOAD_REPEAT:
+            self.alarm_at = now
+            self.alarm_due = True
+            self.set_status(f"CPU 과부하가 {lasted / 60:.0f}분째 이어지는 중 — 지금 {self.total_cpu:.0f}%", RED)
+
     def window_signals(self) -> str:
         """창 제목과 작업 표시줄 아이콘에 띄울 제어 문자. 측정값이 바뀔 때만 다시 보낸다.
 
@@ -1748,8 +1865,7 @@ class Monitor:
         out = f"{ESC}]2;wsc · CPU {self.total_cpu:.0f}% · 메모리 {mem_pct:.0f}%{BEL}"
         if TASKBAR:
             # 상태 1 초록, 4 노랑(일시 정지 색), 2 빨강(오류 색). 0% 는 막대가 안 보여서 1 칸은 채운다
-            frac = self.total_cpu / 100.0
-            state = 2 if frac >= 0.85 else 4 if frac >= 0.60 else 1
+            state = (1, 4, 2)[load_level(self.total_cpu / 100.0)]
             out += f"{ESC}]9;4;{state};{max(1, round(self.total_cpu))}{BEL}"
         return out
 
@@ -2549,6 +2665,12 @@ def restore_console_mode(mode):
         kernel32.SetConsoleMode(kernel32.GetStdHandle(STD_OUTPUT_HANDLE), mode)
 
 
+def window_class(hwnd) -> str:
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, len(name))
+    return name.value
+
+
 def on_pseudo_console() -> bool:
     """의사 콘솔(ConPTY) 위에서 도는가. Windows Terminal·VS Code 같은 요즘 터미널이 이렇다.
 
@@ -2556,11 +2678,117 @@ def on_pseudo_console() -> bool:
     옛 콘솔 창이면 'ConsoleWindowClass' 다.
     """
     hwnd = kernel32.GetConsoleWindow()
+    return bool(hwnd) and window_class(hwnd) == "PseudoConsoleWindow"
+
+
+def taskbar_window():
+    """작업 표시줄 버튼을 가진, 지금 터미널의 창. 못 찾으면 None.
+
+    옛 콘솔은 콘솔 창이 곧 그 창이다. Windows Terminal 은 의사 콘솔의 숨은 창 주인으로 자기 창을
+    걸어 둔다. VS Code 같은 다른 터미널은 남의 창을 건드리지 않게 빼 둔다.
+    """
+    hwnd = kernel32.GetConsoleWindow()
     if not hwnd:
-        return False
-    name = ctypes.create_unicode_buffer(64)
-    user32.GetClassNameW(hwnd, name, len(name))
-    return name.value == "PseudoConsoleWindow"
+        return None
+    name = window_class(hwnd)
+    if name == "ConsoleWindowClass":
+        return hwnd
+    if name == "PseudoConsoleWindow":
+        owner = user32.GetAncestor(hwnd, GA_ROOTOWNER)
+        if owner and window_class(owner) == "CASCADIA_HOSTING_WINDOW_CLASS":
+            return owner
+    return None
+
+
+def badge_icon(rgb):
+    """작업 표시줄 배지로 쓸 동그란 아이콘. 가장자리는 부드럽게 깎고, 테두리를 어둡게 둘러
+    밑에 깔린 터미널 아이콘과 갈리게 한다. 못 만들면 None."""
+    n = BADGE_SIZE
+    header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), n, -n, 1, 32)  # 높이가 음수면 윗줄부터 놓인다
+    bits = ctypes.c_void_p()
+    color = gdi32.CreateDIBSection(None, ctypes.byref(header), 0, ctypes.byref(bits), None, 0)
+    if not color:
+        return None
+    pixels = (ctypes.c_ubyte * (n * n * 4)).from_address(bits.value)
+    mid = (n - 1) / 2
+    radius = n / 2 - 0.5
+    rim = n / 10
+    for y in range(n):
+        for x in range(n):
+            d = math.hypot(x - mid, y - mid)
+            alpha = min(1.0, max(0.0, radius - d + 0.5))
+            shade = 1.0 - 0.45 * min(1.0, max(0.0, d - (radius - rim) + 0.5))
+            r, g, b = (round(c * shade) for c in rgb)
+            at = (y * n + x) * 4
+            pixels[at:at + 4] = (b, g, r, round(alpha * 255))
+    mask = gdi32.CreateBitmap(n, n, 1, 1, None)  # 색 그림에 투명도가 있어서 가림판은 비워 둔다
+    icon = user32.CreateIconIndirect(ctypes.byref(ICONINFO(True, 0, 0, mask, color)))
+    gdi32.DeleteObject(mask)
+    gdi32.DeleteObject(color)
+    return icon
+
+
+def com_guid(text: str):
+    return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
+
+
+class TaskbarButton:
+    """지금 터미널 창의 작업 표시줄 버튼. 아이콘 모서리에 CPU 단계 색 배지를 붙이고, 버튼을 깜빡여 알린다.
+
+    창을 못 찾거나 작업 표시줄 기능을 못 쓰면 아무 일도 안 한다.
+    """
+
+    def __init__(self):
+        self.hwnd = taskbar_window()
+        self.taskbar = ctypes.c_void_p()
+        self.icons = {}
+        self.level = 0
+        if not self.hwnd:
+            return
+        ole32.CoInitialize(None)
+        hr = ole32.CoCreateInstance(
+            com_guid(CLSID_TASKBAR_LIST), None, CLSCTX_INPROC_SERVER,
+            com_guid(IID_TASKBAR_LIST3), ctypes.byref(self.taskbar),
+        )
+        if hr < 0 or not self.taskbar:
+            self.taskbar = ctypes.c_void_p()
+        elif self._call(TASKBAR_HR_INIT) < 0:
+            self._call(COM_RELEASE)
+            self.taskbar = ctypes.c_void_p()
+
+    def _call(self, method, *args):
+        index, proto = method
+        table = ctypes.cast(self.taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return proto(table[index])(self.taskbar, *args)
+
+    def show(self, level: int):
+        """배지를 단계에 맞춘다. 0 이면 뗀다."""
+        if not self.taskbar or level == self.level:
+            return
+        icon = None
+        if level:
+            if level not in self.icons:
+                self.icons[level] = badge_icon(BADGE_COLORS[level])
+            icon = self.icons[level]
+        self._call(TASKBAR_SET_OVERLAY, self.hwnd, icon, BADGE_TEXT.get(level))
+        self.level = level
+
+    def flash(self, flags: int = FLASHW_TRAY | FLASHW_TIMERNOFG):
+        """버튼을 깜빡인다. 창을 앞으로 띄울 때까지 이어진다. 이미 보고 있으면 Windows 가 건너뛴다."""
+        if self.hwnd:
+            user32.FlashWindowEx(ctypes.byref(FLASHWINFO(ctypes.sizeof(FLASHWINFO), self.hwnd, flags, 0, 0)))
+
+    def close(self):
+        """나갈 때. 배지와 깜빡임을 걷는다. 터미널 창은 wsc 가 끝나도 남는다."""
+        self.flash(FLASHW_STOP)
+        if self.taskbar:
+            self.show(0)
+            self._call(COM_RELEASE)
+            self.taskbar = ctypes.c_void_p()
+        for icon in self.icons.values():
+            if icon:
+                user32.DestroyIcon(icon)
+        self.icons.clear()
 
 
 def wants_ascii() -> bool:
@@ -2764,6 +2992,7 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
     # 창 제목은 측정값으로 바꿔 쓰다가 나갈 때 원래대로 돌려놓는다
     saved_title = ctypes.create_unicode_buffer(1024)
     has_title = kernel32.GetConsoleTitleW(saved_title, len(saved_title)) > 0
+    button = TaskbarButton()  # 작업 표시줄 아이콘의 색 배지와 과부하 알림
     monitor.live = True
     monitor.tween.enabled = not USE_ASCII  # 옛 콘솔은 한 장 그리는 게 느려서 애니메이션이 오히려 버벅인다
 
@@ -2791,6 +3020,10 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
             if fresh != signals:
                 signals = fresh
                 sys.stdout.write(fresh)
+            button.show(load_level(monitor.total_cpu / 100.0) if monitor.ready else 0)
+            if monitor.alarm_due:
+                monitor.alarm_due = False
+                button.flash()
             # 키 검사를 먼저, 조건 없이 한다. 한 장 그리는 시간이 갱신 주기보다 길어지면
             # 갱신 분기에만 걸려서 키가 영영 안 읽히기 때문이다.
             # 막대가 미끄러지거나 그래프가 흐르는 등 연출 중이면 다음 장 그릴 때까지만 기다린다
@@ -2836,6 +3069,7 @@ def run_interactive(monitor: Monitor, show_logo: bool = True) -> int:
     finally:
         sys.stdout.write((TASKBAR_CLEAR if TASKBAR else "") + CURSOR_SHOW + ALT_SCREEN_OFF)
         sys.stdout.flush()
+        button.close()
         if has_title:
             kernel32.SetConsoleTitleW(saved_title.value)
         restore_console_mode(saved_mode)
