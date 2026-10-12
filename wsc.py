@@ -32,7 +32,7 @@ import msvcrt  # noqa: E402  윈도우에만 있는 모듈이라 위의 검사 �
 import winreg  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 RAW_URL = "https://raw.githubusercontent.com/seeminglyjs/wsc/main/wsc.py"
 REPO_URL = "https://github.com/seeminglyjs/wsc"
 
@@ -221,11 +221,13 @@ USE_ASCII = False
 # 작업 표시줄 아이콘에 CPU 막대를 띄우는가. Windows Terminal 이 알아듣는 OSC 9;4 를 쓴다.
 # 다른 터미널 몇몇(WezTerm 등)은 OSC 9 를 알림 띄우기로 써서, 자기 이름을 밝힌 터미널에는 안 보낸다
 TASKBAR = False
-# 작업 표시줄 아이콘 모서리에 붙이는 배지 색. CPU 가 노랑·빨강 기준을 넘으면 붙이고 내려오면 뗀다
-BADGE_COLORS = {1: (245, 158, 11), 2: (239, 68, 68)}
+# 작업 표시줄 아이콘 모서리에 붙이는 배지 색. CPU 가 노랑·빨강 기준을 넘으면 붙이고 내려오면 뗀다.
+# 흰 테두리 원 안에 흰 느낌표를 넣어 Windows 알림 배지처럼 보이게 한다
+BADGE_COLORS = {1: (247, 99, 12), 2: (224, 40, 30)}
 BADGE_TEXT = {1: "CPU 높음", 2: "CPU 과부하"}  # 화면 읽기 프로그램이 읽어 주는 배지 설명
-BADGE_SIZE = 32  # 배지 그림 크기(px). 작업 표시줄이 화면 배율에 맞춰 줄여 그린다
-# CPU 가 노랑 기준(60%)을 넘은 채 이만큼(초) 이어지면 작업 표시줄 버튼을 깜빡여 알린다.
+BADGE_BASE = 16  # 배율 100% 에서 배지 크기(px). 작업 표시줄이 줄여 그리면 흐려져서 배율에 맞춰 딱 그 크기로 그린다
+BADGE_SAMPLES = 4  # 한 칸을 가로세로 몇 번씩 찍어 섞는가. 가장자리가 계단 없이 부드러워진다
+# CPU 가 빨강 기준(85%)을 넘은 채 이만큼(초) 이어지면 작업 표시줄 버튼을 깜빡여 알린다.
 # 그 뒤로도 계속 넘어 있으면 OVERLOAD_REPEAT 마다 다시 알린다. 잠깐 내려왔다 다시 오르는 건
 # 같은 과부하로 친다. OVERLOAD_GRACE 넘게 내려가 있어야 끝난 것으로 본다
 OVERLOAD_AFTER = 180.0
@@ -433,6 +435,11 @@ user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, w
 user32.PostMessageW.restype = wintypes.BOOL
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+try:  # Windows 10 1607 부터 있다
+    user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+    user32.GetDpiForWindow.restype = wintypes.UINT
+except AttributeError:
+    pass
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -1544,7 +1551,7 @@ class Monitor:
         self.row_text = {}  # {표 안 순서: 글자만 남긴 줄} 지난번에 그린 것. 바뀐 글자를 찾는다
         self.decoding = {}  # {표 안 순서: (바꿀 칸 목록, 시작 시각)} 해독되며 바뀌는 줄
         # CPU 과부하 알림
-        self.overload_since = None  # CPU 가 노랑 기준을 넘기 시작한 시각. 과부하가 아니면 None
+        self.overload_since = None  # CPU 가 빨강 기준을 넘기 시작한 시각. 과부하가 아니면 None
         self.calm_since = None  # 과부하 중에 기준 아래로 내려온 시각
         self.alarm_at = None  # 이번 과부하에서 마지막으로 알린 시각
         self.alarm_due = False  # 작업 표시줄 버튼을 깜빡일 차례. 대화형 화면이 받아서 깜빡인다
@@ -1833,9 +1840,9 @@ class Monitor:
             self.kill_watch = (pid, born, row_key, time.monotonic() + 5.0)
 
     def watch_overload(self, now: float):
-        """CPU 가 노랑 기준을 넘은 채 OVERLOAD_AFTER 초 이어지면 알린다. 그 뒤로도 이어지면
+        """CPU 가 빨강 기준을 넘은 채 OVERLOAD_AFTER 초 이어지면 알린다. 그 뒤로도 이어지면
         OVERLOAD_REPEAT 초마다 다시 알린다."""
-        if load_level(self.total_cpu / 100.0) == 0:
+        if load_level(self.total_cpu / 100.0) < 2:
             if self.overload_since is not None:
                 self.calm_since = self.calm_since or now
                 if now - self.calm_since >= OVERLOAD_GRACE:
@@ -2700,28 +2707,42 @@ def taskbar_window():
     return None
 
 
-def badge_icon(rgb):
-    """작업 표시줄 배지로 쓸 동그란 아이콘. 가장자리는 부드럽게 깎고, 테두리를 어둡게 둘러
-    밑에 깔린 터미널 아이콘과 갈리게 한다. 못 만들면 None."""
-    n = BADGE_SIZE
-    header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), n, -n, 1, 32)  # 높이가 음수면 윗줄부터 놓인다
+def badge_shade(u: float, v: float):
+    """배지의 한 점 색. u, v 는 배지 안 위치(0~1). 'ring'·'glyph'·'fill' 중 하나, 바깥이면 None."""
+    d = math.hypot(u - 0.5, v - 0.5)
+    if d > 0.5:
+        return None
+    if d > 0.41:  # 흰 테두리. 밑에 깔린 터미널 아이콘과 배지를 갈라 준다
+        return "ring"
+    # 느낌표: 끝이 둥근 세로 막대와 그 아래 점
+    if math.hypot(u - 0.5, v - min(max(v, 0.27), 0.56)) <= 0.075 or math.hypot(u - 0.5, v - 0.73) <= 0.08:
+        return "glyph"
+    return "fill"
+
+
+def badge_icon(rgb, size: int):
+    """작업 표시줄 배지로 쓸 아이콘. 흰 테두리 원 안에 흰 느낌표. 못 만들면 None."""
+    header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), size, -size, 1, 32)  # 높이가 음수면 윗줄부터 놓인다
     bits = ctypes.c_void_p()
     color = gdi32.CreateDIBSection(None, ctypes.byref(header), 0, ctypes.byref(bits), None, 0)
     if not color:
         return None
-    pixels = (ctypes.c_ubyte * (n * n * 4)).from_address(bits.value)
-    mid = (n - 1) / 2
-    radius = n / 2 - 0.5
-    rim = n / 10
-    for y in range(n):
-        for x in range(n):
-            d = math.hypot(x - mid, y - mid)
-            alpha = min(1.0, max(0.0, radius - d + 0.5))
-            shade = 1.0 - 0.45 * min(1.0, max(0.0, d - (radius - rim) + 0.5))
-            r, g, b = (round(c * shade) for c in rgb)
-            at = (y * n + x) * 4
-            pixels[at:at + 4] = (b, g, r, round(alpha * 255))
-    mask = gdi32.CreateBitmap(n, n, 1, 1, None)  # 색 그림에 투명도가 있어서 가림판은 비워 둔다
+    pixels = (ctypes.c_ubyte * (size * size * 4)).from_address(bits.value)
+    paint = {"ring": (255, 255, 255), "glyph": (255, 255, 255), "fill": rgb}
+    k = BADGE_SAMPLES
+    for y in range(size):
+        for x in range(size):
+            r = g = b = hits = 0
+            for sy in range(k):
+                for sx in range(k):
+                    part = badge_shade((x + (sx + 0.5) / k) / size, (y + (sy + 0.5) / k) / size)
+                    if part:
+                        pr, pg, pb = paint[part]
+                        r, g, b, hits = r + pr, g + pg, b + pb, hits + 1
+            at = (y * size + x) * 4
+            if hits:
+                pixels[at:at + 4] = (b // hits, g // hits, r // hits, hits * 255 // (k * k))
+    mask = gdi32.CreateBitmap(size, size, 1, 1, None)  # 색 그림에 투명도가 있어서 가림판은 비워 둔다
     icon = user32.CreateIconIndirect(ctypes.byref(ICONINFO(True, 0, 0, mask, color)))
     gdi32.DeleteObject(mask)
     gdi32.DeleteObject(color)
@@ -2761,6 +2782,13 @@ class TaskbarButton:
         table = ctypes.cast(self.taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
         return proto(table[index])(self.taskbar, *args)
 
+    def badge_size(self) -> int:
+        """터미널 창이 놓인 화면 배율에 맞춘 배지 크기(px)."""
+        dpi = 96
+        if hasattr(user32, "GetDpiForWindow"):
+            dpi = user32.GetDpiForWindow(self.hwnd) or 96
+        return max(BADGE_BASE, round(BADGE_BASE * dpi / 96))
+
     def show(self, level: int):
         """배지를 단계에 맞춘다. 0 이면 뗀다."""
         if not self.taskbar or level == self.level:
@@ -2768,7 +2796,7 @@ class TaskbarButton:
         icon = None
         if level:
             if level not in self.icons:
-                self.icons[level] = badge_icon(BADGE_COLORS[level])
+                self.icons[level] = badge_icon(BADGE_COLORS[level], self.badge_size())
             icon = self.icons[level]
         self._call(TASKBAR_SET_OVERLAY, self.hwnd, icon, BADGE_TEXT.get(level))
         self.level = level
